@@ -38,6 +38,11 @@ public class VideoOutput: NSObject {
   private var textureId: Int64 = -1
   private var currentSize: CGSize = CGSize.zero
   private var disposed: Bool = false
+  // Requested iOS enhancement pipeline (nil on every other platform).
+  private var enhanceConfiguration: VideoEnhanceConfiguration?
+  // Kept so that the enhancement pipeline can be reconfigured at runtime
+  // without recreating the texture.
+  private var hardwareTexture: TextureHW?
 
   init(
     handle: Int64,
@@ -52,6 +57,7 @@ public class VideoOutput: NSObject {
     width = configuration.width
     height = configuration.height
     enableHardwareAcceleration = configuration.enableHardwareAcceleration
+    enhanceConfiguration = configuration.enhance
     self.registry = registry
     self.textureUpdateCallback = textureUpdateCallback
 
@@ -74,6 +80,19 @@ public class VideoOutput: NSObject {
       guard !self.disposed else { return }
       self.width = width
       self.height = height
+    }
+  }
+
+  /// Hot-swaps the enhancement pipeline. \`nil\` disables it.
+  ///
+  /// Runs on the render worker so that it is ordered against \`render\` calls.
+  public func setEnhancePipeline(_ configuration: VideoEnhanceConfiguration?) {
+    enhanceConfiguration = configuration
+    worker.enqueue {
+      guard !self.disposed else { return }
+      #if os(iOS)
+        self.hardwareTexture?.setEnhancePipeline(configuration)
+      #endif
     }
   }
 
@@ -107,12 +126,29 @@ public class VideoOutput: NSObject {
     let update: () -> Void = { [weak self] in
       self?.updateCallback()
     }
+    // Invoked by the enhancement pipeline when it produced a frame without mpv
+    // being involved (e.g. an interpolated frame). It must not trigger another
+    // mpv render.
+    let notify: () -> Void = { [weak self] in
+      self?.notifyFrameAvailable()
+    }
     var hardwareTexture: ResizableTextureProtocol?
     if enableHardwareAcceleration {
-      hardwareTexture = TextureHW(
-        handle: handle,
-        updateCallback: update
-      )
+      #if os(iOS)
+        let texture = TextureHW(
+          handle: handle,
+          configuration: enhanceConfiguration,
+          updateCallback: update,
+          notifyCallback: notify
+        )
+        self.hardwareTexture = texture
+        hardwareTexture = texture
+      #else
+        hardwareTexture = TextureHW(
+          handle: handle,
+          updateCallback: update
+        )
+      #endif
     }
     if let hardwareTexture = hardwareTexture {
       texture = SafeResizableTexture(hardwareTexture)
@@ -163,6 +199,24 @@ public class VideoOutput: NSObject {
     }
   }
 
+  /// Notifies Flutter that a new frame (produced by the enhancement pipeline)
+  /// is ready to be pulled. Unlike \`updateCallback\` this does not render a new
+  /// mpv frame.
+  public func notifyFrameAvailable() {
+    worker.enqueue {
+      self._notifyTexture()
+    }
+  }
+
+  private func _notifyTexture() {
+    guard !disposed else { return }
+    DispatchQueue.main.sync { [weak self] in
+      guard let that = self else { return }
+      // Textures must be marked as available from the main thread
+      that.registry.textureFrameAvailable(that.textureId)
+    }
+  }
+
   private func _updateCallback() {
     guard !disposed else { return }
     let size = videoSize
@@ -187,11 +241,7 @@ public class VideoOutput: NSObject {
     }
 
     texture.render(size)
-    DispatchQueue.main.sync { [weak self] in
-      guard let that = self else { return }
-      // Textures must be marked as available from the main thread
-      that.registry.textureFrameAvailable(that.textureId)
-    }
+    _notifyTexture()
   }
 
     private var videoSize: CGSize {

@@ -60,6 +60,8 @@ public class MediaKitVideoPlugin: NSObject, FlutterPlugin {
       handleSetSizeMethodCall(call.arguments, result)
     case "VideoOutputManager.Dispose":
       handleDisposeMethodCall(call.arguments, result)
+    case "VideoOutputManager.SetEnhancePipeline":
+      handleSetEnhancePipelineMethodCall(call.arguments, result)
     case "Utils.EnterNativeFullscreen":
       handleEnterNativeFullscreenMethodCall(call.arguments, result)
     case "Utils.ExitNativeFullscreen":
@@ -148,6 +150,33 @@ public class MediaKitVideoPlugin: NSObject, FlutterPlugin {
       handle: handle!,
       completion: { result(nil) }
     )
+  }
+
+  private func handleSetEnhancePipelineMethodCall(
+    _ arguments: Any?,
+    _ result: FlutterResult
+  ) {
+    let args = arguments as? [String: Any]
+    guard let handleStr = args?["handle"] as? String,
+      let handle = Int64(handleStr)
+    else {
+      result(false)
+      return
+    }
+
+    // A nil configuration means "turn enhancement off".
+    let configuration = VideoEnhanceConfiguration.fromDict(
+      args?["enhance"] as? [String: Any]
+    )
+
+    videoOutputManager.setEnhancePipeline(
+      handle: handle,
+      configuration: configuration
+    )
+
+    // Acceptance only: the actual pipeline is (re)built asynchronously on the
+    // render worker. Callers must tolerate a later fallback to plain rendering.
+    result(true)
   }
 
   private func handleEnterNativeFullscreenMethodCall(

@@ -1,3 +1,4 @@
+import CoreMedia
 import Flutter
 import OpenGLES
 
@@ -10,6 +11,7 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
 
   private let handle: OpaquePointer
   private let updateCallback: UpdateCallback
+  private let notifyCallback: UpdateCallback
   private let context: EAGLContext
   private let textureCache: CVOpenGLESTextureCache
   private var renderContext: OpaquePointer?
@@ -18,12 +20,27 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     skipCheckArgs: true
   )
 
+  // MARK: Enhancement pipeline
+
+  /// Requested enhancement configuration (nil = plain rendering).
+  private var enhanceConfiguration: VideoEnhanceConfiguration?
+  /// Active pipeline. Only created when the device can run what was requested.
+  private var enhancer: FrameEnhancerProtocol?
+  /// Size of the buffers mpv renders into; also the size handed to Flutter.
+  private var currentSize: CGSize = .zero
+  /// Monotonic frame counter, exposed to the enhancer for logging/ordering.
+  private var frameIndex: Int64 = 0
+
   init(
     handle: OpaquePointer,
-    updateCallback: @escaping UpdateCallback
+    configuration: VideoEnhanceConfiguration?,
+    updateCallback: @escaping UpdateCallback,
+    notifyCallback: @escaping UpdateCallback
   ) {
     self.handle = handle
+    self.enhanceConfiguration = configuration
     self.updateCallback = updateCallback
+    self.notifyCallback = notifyCallback
     self.context = OpenGLESHelpers.createContext()
     self.textureCache = OpenGLESHelpers.createTextureCache(context)
 
@@ -33,6 +50,8 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
   }
 
   deinit {
+    enhancer?.invalidate()
+    enhancer = nil
     disposePixelBuffer()
     disposeMPV()
     OpenGLESHelpers.deleteTextureCache(textureCache)
@@ -45,6 +64,13 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
   }
 
   public func copyPixelBuffer() -> Unmanaged<CVPixelBuffer>? {
+    // Enhanced frames take priority. The queue hands out the newest finished
+    // frame without consuming it, so repeated pulls within one vsync return the
+    // same buffer (Flutter may pull several times per frame).
+    if let enhancer = enhancer, let enhanced = enhancer.latestFrame() {
+      return Unmanaged.passRetained(enhanced)
+    }
+
     let textureContext = textureContexts.current
     if textureContext == nil {
       return nil
@@ -54,7 +80,15 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
   }
 
   public func dispose() {
+    enhancer?.invalidate()
+    enhancer = nil
     disposeMPV()
+  }
+
+  /// Hot-swaps the enhancement pipeline. Must be called on the render worker.
+  public func setEnhancePipeline(_ configuration: VideoEnhanceConfiguration?) {
+    enhanceConfiguration = configuration
+    configureEnhancer(currentSize)
   }
 
   private func initMPV() {
@@ -125,6 +159,8 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
 
     NSLog("TextureGL: resize: \(size.width)x\(size.height)")
     createPixelBuffer(size)
+    currentSize = size
+    configureEnhancer(size)
   }
 
   private func createPixelBuffer(_ size: CGSize) {
@@ -154,6 +190,66 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
 
   private func disposePixelBuffer() {
     textureContexts.reinit(objects: [], skipCheckArgs: true)
+  }
+
+  // MARK: - Enhancement
+
+  /// Builds (or rebuilds) the pipeline for the given frame size.
+  ///
+  /// Compiling Anime4K takes hundreds of milliseconds and runs on the render
+  /// worker, so it only happens when the size or the configuration changes.
+  private func configureEnhancer(_ size: CGSize) {
+    guard size.width > 0, size.height > 0 else {
+      return
+    }
+
+    guard let configuration = enhanceConfiguration else {
+      enhancer?.invalidate()
+      enhancer = nil
+      return
+    }
+
+    if enhancer == nil {
+      enhancer = VideoEnhancerFactory.make(configuration: configuration)
+      enhancer?.onFrameAvailable = { [weak self] in
+        // An enhanced frame (e.g. an interpolated one) is ready without mpv
+        // having produced anything: notify Flutter without re-rendering.
+        self?.notifyCallback()
+      }
+    }
+
+    guard let enhancer = enhancer else {
+      NSLog("TextureHW: no enhancement pipeline available; using plain rendering")
+      self.enhancer = nil
+      return
+    }
+
+    // \`outputSize\` feeds the Anime4K \`OUTPUT\` variable used by the
+    // AutoDownscalePre passes. The Flutter video surface size is not known
+    // here, so the decoded size is used; the CNN is then downsampled back to
+    // it by the finalize kernel.
+    let ready = enhancer.configure(
+      configuration: configuration,
+      inputSize: size,
+      outputSize: size
+    )
+
+    if !ready {
+      NSLog(
+        "TextureHW: enhancement pipeline rejected the configuration (\(configuration.anime4kProfile)); using plain rendering"
+      )
+      enhancer.invalidate()
+      self.enhancer = nil
+    }
+  }
+
+  private func currentPresentationTime() -> CMTime {
+    // \`time-pos\` is the playback position mpv is showing. It is a far better
+    // anchor than a wall clock because it survives seeks and rate changes.
+    if let position = MPVHelpers.getDoubleProperty(handle, "time-pos") {
+      return CMTime(seconds: position, preferredTimescale: 1000)
+    }
+    return CMClockGetTime(CMClockGetHostTimeClock())
   }
 
   public func render(_ size: CGSize) {
@@ -192,6 +288,17 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     glFlush()
 
     textureContexts.pushAsReady(textureContext!)
+
+    // Hand the freshly rendered buffer to the enhancement pipeline. \`submit\` is
+    // documented to copy whatever it needs, so the GL buffer can be recycled.
+    if let enhancer = enhancer, enhancer.isActive {
+      frameIndex += 1
+      enhancer.submit(
+        textureContext!.pixelBuffer,
+        presentationTime: currentPresentationTime(),
+        frameIndex: frameIndex
+      )
+    }
   }
 
   static private func getProcAddress(

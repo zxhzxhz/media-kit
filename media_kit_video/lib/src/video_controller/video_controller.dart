@@ -164,6 +164,30 @@ class VideoController {
     );
   }
 
+  /// Hot-swaps the enhancement pipeline. Only supported on iOS 26+ with the
+  /// native VideoOutputManager.SetEnhancePipeline implementation; returns
+  /// false on other platforms or when the player has no native controller.
+  Future<bool> setEnhancePipeline(
+    VideoEnhanceConfiguration? configuration,
+  ) async {
+    try {
+      final instance = await platform.future;
+      if (instance is NativeVideoController) {
+        // NOTE: [setEnhancePipeline] is only declared by the native (io)
+        // implementation of [NativeVideoController]. The web stub selected by
+        // the conditional import does not declare it, so the call goes through
+        // a dynamic reference to keep every target compiling. A missing method
+        // is caught below & reported as false.
+        final dynamic native = instance;
+        final result = await native.setEnhancePipeline(configuration);
+        return result is bool ? result : false;
+      }
+      return false;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// A [Future] that completes when the first video frame has been rendered.
   Future<void> get waitUntilFirstFrameRendered async {
     final instance = await platform.future;

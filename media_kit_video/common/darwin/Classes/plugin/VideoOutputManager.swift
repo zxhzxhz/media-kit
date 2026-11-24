@@ -43,6 +43,18 @@ public class VideoOutputManager: NSObject {
     )
   }
 
+  public func setEnhancePipeline(
+    handle: Int64,
+    configuration: VideoEnhanceConfiguration?
+  ) {
+    let videoOutput = self.videoOutputs[handle]
+    if videoOutput == nil {
+      return
+    }
+
+    videoOutput!.setEnhancePipeline(configuration)
+  }
+
   public func destroy(
     handle: Int64,
     completion: @escaping () -> Void

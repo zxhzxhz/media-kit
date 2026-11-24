@@ -13,6 +13,21 @@ public enum MPVHelpers {
     }
   }
 
+  /// Reads a double valued mpv property (e.g. \`time-pos\` / \`audio-pts\`).
+  /// Returns nil when the property is unavailable yet.
+  public static func getDoubleProperty(
+    _ handle: OpaquePointer,
+    _ name: String
+  ) -> Double? {
+    var value: Double = 0
+    guard
+      media_kit_mpv_get_property(handle, name, MPV_FORMAT_DOUBLE, &value) >= 0
+    else {
+      return nil
+    }
+    return value
+  }
+
   public static func getVideoOutParams(
     _ handle: OpaquePointer
   ) -> MPVVideoOutParams {

@@ -66,6 +66,82 @@ abstract class PlatformVideoController {
   }
 }
 
+/// {@template video_enhance_configuration}
+///
+/// VideoEnhanceConfiguration
+/// -------------------------
+/// Configurable options for the native video enhancement pipeline.
+///
+/// These options are currently honored by the iOS implementation only
+/// (iOS 26.0 & above). On every other platform, the native implementations
+/// ignore them & the video output is rendered as-is.
+///
+/// {@endtemplate}
+class VideoEnhanceConfiguration {
+  /// Whether to enable low-latency 2x frame interpolation through
+  /// `VTFrameProcessor` on native backend.
+  ///
+  /// Default: `false`
+  final bool interpolation;
+
+  /// The scale factor for the low-latency super resolution through
+  /// `VTFrameProcessor` on native backend.
+  ///
+  /// `0` disables super resolution.
+  ///
+  /// Default: `0.0`
+  final double vtScaleFactor;
+
+  /// List of Anime4K GLSL shader sources, applied in the given order.
+  ///
+  /// An empty list disables Anime4K shader-based upscaling.
+  ///
+  /// Default: `const []`
+  final List<String> anime4kShaders;
+
+  /// Name of the Anime4K profile.
+  ///
+  /// Only used by the native implementation for caching & logging purposes.
+  ///
+  /// Default: `'off'`
+  final String anime4kProfile;
+
+  /// Whether at least one enhancement stage is enabled.
+  bool get isEnabled =>
+      interpolation || vtScaleFactor > 0 || anime4kShaders.isNotEmpty;
+
+  /// {@macro video_enhance_configuration}
+  const VideoEnhanceConfiguration({
+    this.interpolation = false,
+    this.vtScaleFactor = 0.0,
+    this.anime4kShaders = const [],
+    this.anime4kProfile = 'off',
+  });
+
+  /// Returns a map representation of this class, used for passing the
+  /// configuration to the native implementation.
+  Map<String, dynamic> toMap() => {
+        'interpolation': interpolation,
+        'vtScaleFactor': vtScaleFactor,
+        'anime4kShaders': anime4kShaders,
+        'anime4kProfile': anime4kProfile,
+      };
+
+  /// Returns a copy of this class with the given fields replaced by the new values.
+  VideoEnhanceConfiguration copyWith({
+    bool? interpolation,
+    double? vtScaleFactor,
+    List<String>? anime4kShaders,
+    String? anime4kProfile,
+  }) =>
+      VideoEnhanceConfiguration(
+        interpolation: interpolation ?? this.interpolation,
+        vtScaleFactor: vtScaleFactor ?? this.vtScaleFactor,
+        anime4kShaders: anime4kShaders ?? this.anime4kShaders,
+        anime4kProfile: anime4kProfile ?? this.anime4kProfile,
+      );
+}
+
 /// {@template video_controller_configuration}
 ///
 /// VideoControllerConfiguration
@@ -131,6 +207,14 @@ class VideoControllerConfiguration {
   /// * [vo] != gpu : `false`
   final bool? androidAttachSurfaceAfterVideoParameters;
 
+  /// Native video enhancement pipeline configuration.
+  ///
+  /// This option only has effect on iOS 26.0 & above. On other platforms
+  /// the value is ignored.
+  ///
+  /// Default: `null`
+  final VideoEnhanceConfiguration? enhance;
+
   /// {@macro video_controller_configuration}
   const VideoControllerConfiguration({
     this.vo,
@@ -141,6 +225,7 @@ class VideoControllerConfiguration {
     this.enableHardwareAcceleration = true,
     this.enableAndroidSurfaceProducer = true,
     this.androidAttachSurfaceAfterVideoParameters,
+    this.enhance,
   });
 
   /// Returns a copy of this class with the given fields replaced by the new values.
@@ -153,6 +238,7 @@ class VideoControllerConfiguration {
     bool? enableHardwareAcceleration,
     bool? enableAndroidSurfaceProducer,
     bool? androidAttachSurfaceAfterVideoParameters,
+    VideoEnhanceConfiguration? enhance,
   }) =>
       VideoControllerConfiguration(
         vo: vo ?? this.vo,
@@ -167,5 +253,6 @@ class VideoControllerConfiguration {
         androidAttachSurfaceAfterVideoParameters:
             androidAttachSurfaceAfterVideoParameters ??
                 this.androidAttachSurfaceAfterVideoParameters,
+        enhance: enhance ?? this.enhance,
       );
 }

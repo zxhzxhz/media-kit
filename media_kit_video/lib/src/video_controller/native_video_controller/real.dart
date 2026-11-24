@@ -179,6 +179,7 @@ class NativeVideoController extends PlatformVideoController {
             'height': configuration.height.toString(),
             'enableHardwareAcceleration':
                 configuration.enableHardwareAcceleration,
+            'enhance': configuration.enhance?.toMap(),
           },
         },
       );
@@ -235,6 +236,19 @@ class NativeVideoController extends PlatformVideoController {
         },
       );
     }
+  }
+
+  /// Hot-swaps the enhancement pipeline without recreating the [VideoController].
+  /// Returns true when the native side accepted the new configuration.
+  Future<bool> setEnhancePipeline(
+    VideoEnhanceConfiguration? configuration,
+  ) async {
+    final handle = await player.handle;
+    final result = await _channel.invokeMethod<bool>(
+      'VideoOutputManager.SetEnhancePipeline',
+      {'handle': handle.toString(), 'enhance': configuration?.toMap()},
+    );
+    return result ?? false;
   }
 
   /// Disposes the instance. Releases allocated resources back to the system.
