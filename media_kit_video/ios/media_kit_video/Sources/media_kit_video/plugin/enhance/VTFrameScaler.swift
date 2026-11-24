@@ -29,6 +29,8 @@ import VideoToolbox
     /// The scale factor is not in `supportedScaleFactors`.
     case unsupportedScaleFactor(Float)
     case scalingFailed(Error)
+    /// `process` neither completed nor reported an error in time.
+    case timedOut
   }
 
   /// Availability probe callable from iOS 13 deployment targets.
@@ -126,6 +128,11 @@ import VideoToolbox
   /// Wraps a single `VTFrameProcessor` low-latency super resolution session.
   @available(iOS 26.0, *)
   final class VTFrameScaler {
+    /// `process` must complete before the next submission: the processor
+    /// forbids concurrent work, and a hung session would silently stop
+    /// producing frames (which shows up as a black picture).
+    private static let processTimeout = DispatchTimeInterval.milliseconds(250)
+
     private let frameWidth: Int
     private let frameHeight: Int
     private let outputWidth: Int
@@ -136,6 +143,21 @@ import VideoToolbox
     /// Guards `processor` for readers outside `queue`.
     private let lock = NSLock()
     private var processor: VTFrameProcessor?
+
+    /// Pixel formats VideoToolbox advertises for this configuration.
+    private(set) var supportedFormats: [OSType] = []
+    /// `false` when the advertised formats are known and do not include BGRA.
+    private(set) var acceptsBGRASource = true
+
+    private var submitted: Int = 0
+    private var succeeded: Int = 0
+    private var failed: Int = 0
+    private var timedOut: Int = 0
+
+    /// Compact counters, surfaced through the enhancer status string.
+    var statsDescription: String {
+      return "scale submit=\(submitted) ok=\(succeeded) fail=\(failed) to=\(timedOut)"
+    }
 
     /// Output size for a given input, exposed so the caller can size its pool.
     static func outputSize(
@@ -176,6 +198,15 @@ import VideoToolbox
         frameHeight: height,
         scaleFactor: scaleFactor
       )
+
+      let formats = configuration.__frameSupportedPixelFormats.map {
+        $0.uint32Value
+      }
+      self.supportedFormats = formats
+      if !formats.isEmpty {
+        self.acceptsBGRASource = formats.contains(kCVPixelFormatType_32BGRA)
+      }
+
       let processor = VTFrameProcessor()
       do {
         try processor.startSession(configuration: configuration)
@@ -286,16 +317,42 @@ import VideoToolbox
           destinationFrame: destinationFrame
         )
 
+        // Same reasoning as VTFrameInterpolator: waiting here is what keeps
+        // submissions from overlapping, and a timeout is reported instead of
+        // blocking the render worker forever.
+        self.submitted += 1
+        let semaphore = DispatchSemaphore(value: 0)
+        let errorLock = NSLock()
+        var processError: Error?
         processor.process(parameters: parameters) { _, error in
-          if let error = error {
-            self.finish(
-              completion,
-              .failure(VTFrameScalerError.scalingFailed(error))
-            )
-            return
-          }
-          self.finish(completion, .success(()))
+          errorLock.lock()
+          processError = error
+          errorLock.unlock()
+          semaphore.signal()
         }
+
+        if semaphore.wait(timeout: .now() + VTFrameScaler.processTimeout)
+          == .timedOut
+        {
+          self.timedOut += 1
+          self.finish(completion, .failure(VTFrameScalerError.timedOut))
+          return
+        }
+
+        errorLock.lock()
+        let error = processError
+        errorLock.unlock()
+
+        if let error = error {
+          self.failed += 1
+          self.finish(
+            completion,
+            .failure(VTFrameScalerError.scalingFailed(error))
+          )
+          return
+        }
+        self.succeeded += 1
+        self.finish(completion, .success(()))
       }
     }
 

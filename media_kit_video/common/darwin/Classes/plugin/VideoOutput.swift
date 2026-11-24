@@ -292,11 +292,15 @@ public class VideoOutput: NSObject {
     let needsSample = clockSampleHostTime == 0
       || now - clockSampleHostTime > 0.066
     if needsSample {
-      if let position = MPVHelpers.getDoubleProperty(handle, "audio-pts") {
+      // `time-pos` first: TextureHW stamps every submitted frame with
+      // `time-pos`, so the clock and the frame timestamps stay in one domain.
+      // Mixing in `audio-pts` shifted the clock by tens of milliseconds and
+      // made the display link settle on the oldest queued frame (flat 24 fps).
+      if let position = MPVHelpers.getDoubleProperty(handle, "time-pos") {
         clockBaseSeconds = position
         clockBaseHostTime = now
         clockSampleHostTime = now
-      } else if let position = MPVHelpers.getDoubleProperty(handle, "time-pos") {
+      } else if let position = MPVHelpers.getDoubleProperty(handle, "audio-pts") {
         clockBaseSeconds = position
         clockBaseHostTime = now
         clockSampleHostTime = now
@@ -308,7 +312,7 @@ public class VideoOutput: NSObject {
 
     // Clamp the extrapolation: while paused the clock does not advance, and a
     // stale sample must not produce a runaway value.
-    let elapsed = min(max(now - clockBaseHostTime, 0), 0.5)
+    let elapsed = min(max(now - clockBaseHostTime, 0), 0.12)
     return CMTime(seconds: clockBaseSeconds + elapsed, preferredTimescale: 1000)
   }
 

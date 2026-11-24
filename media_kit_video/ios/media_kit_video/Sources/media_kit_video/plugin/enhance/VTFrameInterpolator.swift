@@ -30,6 +30,8 @@ enum VTFrameInterpolatorError: Error {
   /// `VTFrameProcessorFrame` rejected a buffer.
   case frameCreationFailed
   case interpolationFailed(Error)
+  /// `process` neither completed nor reported an error in time.
+  case timedOut
 }
 
 /// Availability probe that is callable from iOS 13 deployment targets.
@@ -136,6 +138,11 @@ enum VTFrameInterpolationSupport {
 /// Wraps a single `VTFrameProcessor` low-latency interpolation session.
 @available(iOS 26.0, *)
 final class VTFrameInterpolator {
+  /// `process` must complete before the next submission: the processor forbids
+  /// concurrent work. 1080p interpolation takes a few ms, so 250 ms means
+  /// "hung", not "slow".
+  private static let processTimeout = DispatchTimeInterval.milliseconds(250)
+
   private let frameWidth: Int
   private let frameHeight: Int
   /// Serialises submissions: the processor forbids concurrent work.
@@ -143,6 +150,24 @@ final class VTFrameInterpolator {
   /// Guards `processor` for readers outside `queue` (namely `isReady`).
   private let lock = NSLock()
   private var processor: VTFrameProcessor?
+
+  /// Pixel formats VideoToolbox advertises for this configuration. Empty when
+  /// the property is unavailable.
+  private(set) var supportedFormats: [OSType] = []
+  /// `false` when the advertised formats are known and do not include the BGRA
+  /// buffers TextureHW produces; submitting them would fail or yield blank
+  /// output, so the caller must not enable interpolation.
+  private(set) var acceptsBGRASource = true
+
+  private var submitted: Int = 0
+  private var succeeded: Int = 0
+  private var failed: Int = 0
+  private var timedOut: Int = 0
+
+  /// Compact counters, surfaced through the enhancer status string.
+  var statsDescription: String {
+    return "interp submit=\(submitted) ok=\(succeeded) fail=\(failed) to=\(timedOut)"
+  }
 
   /// Starts the session; nil when the size is rejected or `startSession` throws.
   init?(width: Int, height: Int) {
@@ -155,6 +180,14 @@ final class VTFrameInterpolator {
         frameWidth: width, frameHeight: height, numberOfInterpolatedFrames: 1
       )
     else { return nil }
+
+    let formats = configuration.__frameSupportedPixelFormats.map {
+      $0.uint32Value
+    }
+    self.supportedFormats = formats
+    if !formats.isEmpty {
+      self.acceptsBGRASource = formats.contains(kCVPixelFormatType_32BGRA)
+    }
 
     // UNCERTAIN: assumes the no-argument `VTFrameProcessor()` initialiser.
     let processor = VTFrameProcessor()
@@ -252,15 +285,42 @@ final class VTFrameInterpolator {
         return
       }
 
-      // Completion shape verified against VTFrameProcessor.h:
-      // `(VTFrameProcessorParameters?, Error?) -> Void`.
+      // The processor forbids concurrent submissions, and `queue.async` only
+      // serialises the *calls*, not the completions. Wait here so the next
+      // submission cannot overlap this one; a timeout means the processor is
+      // stuck, in which case the frame is dropped instead of blocking forever.
+      self.submitted += 1
+      let semaphore = DispatchSemaphore(value: 0)
+      let errorLock = NSLock()
+      var processError: Error?
       processor.process(parameters: parameters) { _, error in
-        guard let error = error else {
-          self.finish(completion, .success(()))
-          return
-        }
-        self.finish(completion,
-                    .failure(VTFrameInterpolatorError.interpolationFailed(error)))
+        errorLock.lock()
+        processError = error
+        errorLock.unlock()
+        semaphore.signal()
+      }
+
+      if semaphore.wait(timeout: .now() + VTFrameInterpolator.processTimeout)
+        == .timedOut
+      {
+        self.timedOut += 1
+        self.finish(completion, .failure(VTFrameInterpolatorError.timedOut))
+        return
+      }
+
+      errorLock.lock()
+      let error = processError
+      errorLock.unlock()
+
+      if let error = error {
+        self.failed += 1
+        self.finish(
+          completion,
+          .failure(VTFrameInterpolatorError.interpolationFailed(error))
+        )
+      } else {
+        self.succeeded += 1
+        self.finish(completion, .success(()))
       }
     }
   }

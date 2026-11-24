@@ -145,10 +145,26 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
 
     var onFrameAvailable: (() -> Void)?
     private(set) var isActive: Bool = false
-    private var status: String = "VideoToolbox: idle"
+    private var baseStatus: String = "VideoToolbox: idle"
 
+    /// Includes the live submission counters, so the FPS overlay can show
+    /// whether VT is actually producing frames (`ok` growing) or stalling
+    /// (`to` / `fail` growing) without a Console connection.
     var statusDescription: String {
-      return status
+      guard isActive else {
+        return baseStatus
+      }
+      var parts: [String] = [baseStatus]
+      if let interpolator = interpolator {
+        parts.append(interpolator.statsDescription)
+      }
+      if let scaler = scaler {
+        parts.append(scaler.statsDescription)
+      }
+      if failureCount > 0 {
+        parts.append("emitFail=\(failureCount)")
+      }
+      return parts.joined(separator: " | ")
     }
 
     private var width: Int = 0
@@ -181,7 +197,7 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
       let requestedScale = Float(configuration.vtScaleFactor)
       let wantsScaling = requestedScale > 1.0
       guard wantsInterpolation || wantsScaling else {
-        status = "nothing requested"
+        baseStatus = "nothing requested"
         return false
       }
 
@@ -197,8 +213,8 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
         diagnostics.append("interp[\(probe)]")
         guard VTFrameInterpolator.isSupported(width: width, height: height)
         else {
-          status = "unsupported interpolation \(width)x\(height) — \(probe)"
-          NSLog("IOS26VideoEnhancer: \(status)")
+          baseStatus = "unsupported interpolation \(width)x\(height) — \(probe)"
+          NSLog("IOS26VideoEnhancer: \(baseStatus)")
           return false
         }
       }
@@ -216,8 +232,8 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
             scaleFactor: requestedScale
           )
         else {
-          status = "unsupported scaling \(width)x\(height) — \(probe)"
-          NSLog("IOS26VideoEnhancer: \(status)")
+          baseStatus = "unsupported scaling \(width)x\(height) — \(probe)"
+          NSLog("IOS26VideoEnhancer: \(baseStatus)")
           return false
         }
       }
@@ -229,7 +245,7 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
       // The Metal processor always runs: it copies the mpv frame into a buffer
       // that survives across frames. Anime4K only when VT is not scaling.
       guard let processor = processor else {
-        status = "Metal unavailable"
+        baseStatus = "Metal unavailable"
         return false
       }
       let metalReady = processor.configure(
@@ -239,8 +255,8 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
         height: height
       )
       guard metalReady else {
-        status = "Metal rejected \(width)x\(height): \(processor.statusDescription)"
-        NSLog("IOS26VideoEnhancer: \(status)")
+        baseStatus = "Metal rejected \(width)x\(height): \(processor.statusDescription)"
+        NSLog("IOS26VideoEnhancer: \(baseStatus)")
         return false
       }
 
@@ -259,8 +275,8 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
             height: outputHeight
           )
         else {
-          status = "output pool allocation failed \(outputWidth)x\(outputHeight)"
-          NSLog("IOS26VideoEnhancer: \(status)")
+          baseStatus = "output pool allocation failed \(outputWidth)x\(outputHeight)"
+          NSLog("IOS26VideoEnhancer: \(baseStatus)")
           return false
         }
         outputPool = pool
@@ -272,11 +288,18 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
             scaleFactor: requestedScale
           )
         else {
-          status = "scaler session failed \(width)x\(height) — \(diagnostics.joined(separator: " "))"
-          NSLog("IOS26VideoEnhancer: \(status)")
+          baseStatus = "scaler session failed \(width)x\(height) — \(diagnostics.joined(separator: " "))"
+          NSLog("IOS26VideoEnhancer: \(baseStatus)")
           return false
         }
         self.scaler = scaler
+        if !scaler.acceptsBGRASource {
+          baseStatus =
+            "scaler rejects BGRA \(width)x\(height) — advertised formats "
+            + "\(scaler.supportedFormats.map { String($0) }.joined(separator: ","))"
+          NSLog("IOS26VideoEnhancer: \(baseStatus)")
+          return false
+        }
       } else {
         outputPool = nil
         outputWidth = width
@@ -289,11 +312,18 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
         guard
           let interpolator = VTFrameInterpolator(width: width, height: height)
         else {
-          status = "interpolation session failed \(width)x\(height) — \(diagnostics.joined(separator: " "))"
-          NSLog("IOS26VideoEnhancer: \(status)")
+          baseStatus = "interpolation session failed \(width)x\(height) — \(diagnostics.joined(separator: " "))"
+          NSLog("IOS26VideoEnhancer: \(baseStatus)")
           return false
         }
         self.interpolator = interpolator
+        if !interpolator.acceptsBGRASource {
+          baseStatus =
+            "interpolation rejects BGRA \(width)x\(height) — advertised "
+            + "formats \(interpolator.supportedFormats.map { String($0) }.joined(separator: ","))"
+          NSLog("IOS26VideoEnhancer: \(baseStatus)")
+          return false
+        }
       } else {
         interpolator?.invalidate()
         interpolator = nil
@@ -311,10 +341,10 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
         wantsInterpolation ? "interp 2x" : nil,
         wantsScaling ? "scale \(requestedScale)x" : nil,
       ].compactMap { $0 }.joined(separator: " + ")
-      status =
+      baseStatus =
         "active: \(stages) \(width)x\(height) → \(outputWidth)x\(outputHeight), "
         + "anime4k \(wantsScaling ? "off" : configuration.anime4kProfile)"
-      NSLog("IOS26VideoEnhancer: \(status)")
+      NSLog("IOS26VideoEnhancer: \(baseStatus)")
       return true
     }
 
@@ -448,8 +478,12 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
         semaphore.signal()
       }
 
-      if semaphore.wait(timeout: .now() + 0.25) == .timedOut {
+      if semaphore.wait(timeout: .now() + 0.3) == .timedOut {
         recordFailure("scaler timed out")
+        // Fall back to the unscaled frame: leaving the previous frame on
+        // screen is what reads as a freeze or a black picture.
+        frames.push(EnhanceFrame(pixelBuffer: buffer, presentationTime: time))
+        onFrameAvailable?()
         return
       }
 
@@ -458,6 +492,8 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
       lock.unlock()
       if let recorded = recorded {
         recordFailure("scale: \(recorded)")
+        frames.push(EnhanceFrame(pixelBuffer: buffer, presentationTime: time))
+        onFrameAvailable?()
         return
       }
 
@@ -475,10 +511,10 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
         return
       }
       lastFailure = reason
-      status =
+      baseStatus =
         "active but failing: \(width)x\(height) — \(reason) "
         + "(\(failureCount) failures)"
-      NSLog("IOS26VideoEnhancer: \(status)")
+      NSLog("IOS26VideoEnhancer: \(baseStatus)")
     }
 
     private static func makePool(
