@@ -164,10 +164,18 @@ import VideoToolbox
     private var succeeded: Int = 0
     private var failed: Int = 0
     private var timedOut: Int = 0
+    /// Most recent failure, surfaced so "nothing submitted" can be told apart
+    /// from "submitted and rejected".
+    private var lastError: String = ""
 
     /// Compact counters, surfaced through the enhancer status string.
     var statsDescription: String {
-      return "scale submit=\(submitted) ok=\(succeeded) fail=\(failed) to=\(timedOut)"
+      var text =
+        "scale submit=\(submitted) ok=\(succeeded) fail=\(failed) to=\(timedOut)"
+      if !lastError.isEmpty {
+        text += " last=\(lastError)"
+      }
+      return text
     }
 
     /// Output size for a given input, exposed so the caller can size its pool.
@@ -336,7 +344,6 @@ import VideoToolbox
           let vtDestinationConverter = self.vtDestinationConverter
         {
           guard let converted = inputConverter.convert(source) else {
-            self.failed += 1
             self.finish(
               completion,
               .failure(VTFrameScalerError.formatConversionFailed)
@@ -346,7 +353,6 @@ import VideoToolbox
           sourceBuffer = converted
 
           guard let vtBuffer = vtDestinationConverter.makeBuffer() else {
-            self.failed += 1
             self.finish(
               completion,
               .failure(VTFrameScalerError.formatConversionFailed)
@@ -416,7 +422,6 @@ import VideoToolbox
         errorLock.unlock()
 
         if let error = error {
-          self.failed += 1
           self.finish(
             completion,
             .failure(VTFrameScalerError.scalingFailed(error))
@@ -428,7 +433,6 @@ import VideoToolbox
           guard let outputConverter = self.outputConverter,
             outputConverter.convert(vtDestination, to: destination)
           else {
-            self.failed += 1
             self.finish(
               completion,
               .failure(VTFrameScalerError.formatConversionFailed)
@@ -457,10 +461,16 @@ import VideoToolbox
       }
     }
 
+    /// Every failure funnels through here so the counters and the last error
+    /// stay accurate even for branches that fail before submission.
     private func finish(
       _ completion: @escaping (Result<Void, Error>) -> Void,
       _ result: Result<Void, Error>
     ) {
+      if case .failure(let error) = result {
+        failed += 1
+        lastError = "\(error)"
+      }
       queue.async { completion(result) }
     }
   }

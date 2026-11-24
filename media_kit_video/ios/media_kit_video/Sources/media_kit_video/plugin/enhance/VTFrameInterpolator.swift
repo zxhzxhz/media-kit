@@ -176,10 +176,19 @@ final class VTFrameInterpolator {
   private var succeeded: Int = 0
   private var failed: Int = 0
   private var timedOut: Int = 0
+  /// Most recent failure, so the status string can say *why* nothing is being
+  /// produced (a dimension mismatch or a rejected parameter object otherwise
+  /// looks identical to "the stage never ran").
+  private var lastError: String = ""
 
   /// Compact counters, surfaced through the enhancer status string.
   var statsDescription: String {
-    return "interp submit=\(submitted) ok=\(succeeded) fail=\(failed) to=\(timedOut)"
+    var text =
+      "interp submit=\(submitted) ok=\(succeeded) fail=\(failed) to=\(timedOut)"
+    if !lastError.isEmpty {
+      text += " last=\(lastError)"
+    }
+    return text
   }
 
   /// Starts the session; nil when the size is rejected or `startSession` throws.
@@ -312,7 +321,6 @@ final class VTFrameInterpolator {
           convertedPrevious = cached
         } else {
           guard let converted = inputConverter.convert(previous) else {
-            self.failed += 1
             self.finish(
               completion,
               .failure(VTFrameInterpolatorError.formatConversionFailed)
@@ -324,7 +332,6 @@ final class VTFrameInterpolator {
         previousBuffer = convertedPrevious
 
         guard let convertedSource = inputConverter.convert(source) else {
-          self.failed += 1
           self.finish(
             completion,
             .failure(VTFrameInterpolatorError.formatConversionFailed)
@@ -336,7 +343,6 @@ final class VTFrameInterpolator {
         self.previousVTFrameTime = sourceTime
 
         guard let vtDestinationBuffer = inputConverter.makeBuffer() else {
-          self.failed += 1
           self.finish(
             completion,
             .failure(VTFrameInterpolatorError.formatConversionFailed)
@@ -405,7 +411,6 @@ final class VTFrameInterpolator {
       errorLock.unlock()
 
       if let error = error {
-        self.failed += 1
         self.finish(
           completion,
           .failure(VTFrameInterpolatorError.interpolationFailed(error))
@@ -418,7 +423,6 @@ final class VTFrameInterpolator {
         guard let outputConverter = self.outputConverter,
           outputConverter.convert(vtDestination, to: destination)
         else {
-          self.failed += 1
           self.finish(
             completion,
             .failure(VTFrameInterpolatorError.formatConversionFailed)
@@ -451,8 +455,16 @@ final class VTFrameInterpolator {
     return VTFrameInterpolationSupport.isSupported(width: width, height: height)
   }
 
+  /// Every failure funnels through here, so the counters and the last error
+  /// stay accurate even for branches that fail before submission (dimension
+  /// checks, frame or parameter construction). Those used to be invisible:
+  /// `submit` and `fail` both stayed at zero.
   private func finish(_ completion: @escaping (Result<Void, Error>) -> Void,
                       _ result: Result<Void, Error>) {
+    if case .failure(let error) = result {
+      failed += 1
+      lastError = "\(error)"
+    }
     queue.async { completion(result) }
   }
 }

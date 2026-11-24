@@ -155,6 +155,7 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
         return baseStatus
       }
       var parts: [String] = [baseStatus]
+      parts.append("frames=\(submittedFrames)/\(interpolateCalls)")
       if let interpolator = interpolator {
         parts.append(interpolator.statsDescription)
       }
@@ -174,6 +175,11 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
     private var submittedCount: Int64 = 0
     private var failureCount: Int = 0
     private var lastFailure: String = ""
+    /// Frames handed to `submit`, and how many of those reached the
+    /// interpolator. Together they separate "submit is never called" from
+    /// "submit runs but interpolation is skipped".
+    private var submittedFrames: Int = 0
+    private var interpolateCalls: Int = 0
 
     init?() {
       guard let processor = MetalFrameProcessor() else {
@@ -363,6 +369,7 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
       guard isActive, let processor = processor else {
         return
       }
+      submittedFrames += 1
 
       // 1. Take ownership of the decoded frame. The GL texture buffers are
       //    recycled by TextureHW, so anything kept across frames must be a copy.
@@ -399,6 +406,7 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
         )
       )
 
+      interpolateCalls += 1
       interpolator.interpolate(
         previous: previous,
         previousTime: previousPTS,
