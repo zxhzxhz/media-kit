@@ -14,6 +14,32 @@ import 'package:media_kit_video/src/video_controller/android_video_controller/an
 import 'package:media_kit_video/src/video_controller/ohos_video_controller/ohos_video_controller.dart';
 import 'package:media_kit_video/src/video_controller/web_video_controller/web_video_controller.dart';
 
+/// Snapshot of the native renderer state.
+///
+/// [status] is the human readable enhancement pipeline state (what is running,
+/// or why the requested pipeline was refused). [presentedFrames] counts the
+/// distinct frames handed to Flutter, so diffing it over a known interval gives
+/// the real presentation rate.
+class VideoEnhanceStats {
+  final String status;
+  final int presentedFrames;
+
+  const VideoEnhanceStats({
+    required this.status,
+    required this.presentedFrames,
+  });
+
+  /// Used when the platform has no native renderer (web, or not created yet).
+  static const unknown = VideoEnhanceStats(
+    status: 'unavailable',
+    presentedFrames: 0,
+  );
+
+  @override
+  String toString() =>
+      'VideoEnhanceStats(status: $status, presentedFrames: $presentedFrames)';
+}
+
 /// {@template video_controller}
 ///
 /// VideoController
@@ -186,6 +212,33 @@ class VideoController {
     } catch (_) {
       return false;
     }
+  }
+
+  /// Renderer diagnostics and presentation counter.
+  ///
+  /// [VideoEnhanceStats.status] explains what the enhancement pipeline is doing
+  /// (or why it refused to run); [VideoEnhanceStats.presentedFrames] counts the
+  /// distinct frames Flutter pulled, so callers can diff it over time to obtain
+  /// the real presentation rate.
+  Future<VideoEnhanceStats> getEnhanceStats() async {
+    try {
+      final instance = await platform.future;
+      if (instance is NativeVideoController) {
+        // Same dynamic indirection as [setEnhancePipeline]: the web stub of
+        // [NativeVideoController] does not declare [getStats].
+        final dynamic native = instance;
+        final dynamic result = await native.getStats();
+        if (result is Map) {
+          return VideoEnhanceStats(
+            status: result['status']?.toString() ?? 'unknown',
+            presentedFrames: (result['frames'] as num?)?.toInt() ?? 0,
+          );
+        }
+      }
+    } catch (_) {
+      // Fall through to the unknown result.
+    }
+    return VideoEnhanceStats.unknown;
   }
 
   /// A [Future] that completes when the first video frame has been rendered.

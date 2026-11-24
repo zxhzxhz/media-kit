@@ -30,6 +30,16 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
   private var currentSize: CGSize = .zero
   /// Monotonic frame counter, exposed to the enhancer for logging/ordering.
   private var frameIndex: Int64 = 0
+  /// Frame the display link picked for the current clock. Guarded by
+  /// \`presentationLock\` because the render worker writes it while the Flutter
+  /// raster thread reads it from \`copyPixelBuffer\`.
+  private var selectedBuffer: CVPixelBuffer?
+  private let presentationLock = NSLock()
+  /// Last buffer handed to Flutter, used to count *distinct* presented frames.
+  private var lastPresentedBuffer: CVPixelBuffer?
+  private var presentedFrameCount: Int64 = 0
+  /// Human readable state of the enhancement pipeline.
+  private var enhanceStatus: String = "disabled"
 
   init(
     handle: OpaquePointer,
@@ -64,30 +74,100 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
   }
 
   public func copyPixelBuffer() -> Unmanaged<CVPixelBuffer>? {
-    // Enhanced frames take priority. The queue hands out the newest finished
-    // frame without consuming it, so repeated pulls within one vsync return the
-    // same buffer (Flutter may pull several times per frame).
-    if let enhancer = enhancer, let enhanced = enhancer.latestFrame() {
-      return Unmanaged.passRetained(enhanced)
-    }
+    // The display link picks the frame that belongs to the current clock. Until
+    // it has picked one the freshly rendered GL buffer is used, which keeps the
+    // first frames and the non-enhanced path working unchanged.
+    presentationLock.lock()
+    let selected = selectedBuffer
+    presentationLock.unlock()
 
-    let textureContext = textureContexts.current
-    if textureContext == nil {
+    let buffer = selected ?? textureContexts.current?.pixelBuffer
+    guard let buffer = buffer else {
       return nil
     }
 
-    return Unmanaged.passRetained(textureContext!.pixelBuffer)
+    // Count distinct frames so Dart can show the real presentation rate.
+    presentationLock.lock()
+    if lastPresentedBuffer !== buffer {
+      lastPresentedBuffer = buffer
+      presentedFrameCount += 1
+    }
+    presentationLock.unlock()
+
+    return Unmanaged.passRetained(buffer)
+  }
+
+  /// \`true\` once an enhancement pipeline is configured and running.
+  public var hasActiveEnhancer: Bool {
+    return enhancer?.isActive ?? false
+  }
+
+  /// \`true\` once the display link has taken over presentation. From that moment
+  /// \`VideoOutput\` must not notify Flutter on every mpv frame, otherwise the
+  /// pacing decided here is overwritten.
+  public var isDrivingPresentation: Bool {
+    presentationLock.lock()
+    defer {
+      presentationLock.unlock()
+    }
+    return selectedBuffer != nil
+  }
+
+  /// Picks the enhanced frame that belongs to \`clock\`.
+  ///
+  /// Returns \`true\` when the frame to present changed, so the caller knows it
+  /// has to wake Flutter. Runs on the render worker.
+  public func selectFrame(at clock: CMTime) -> Bool {
+    guard let enhancer = enhancer, enhancer.isActive else {
+      return false
+    }
+    guard let next = enhancer.frame(nearestTo: clock) else {
+      return false
+    }
+
+    presentationLock.lock()
+    let changed = selectedBuffer !== next
+    selectedBuffer = next
+    presentationLock.unlock()
+
+    return changed
+  }
+
+  /// Human readable enhancement state (see \`FrameEnhancerProtocol.statusDescription\`).
+  public func enhanceStatusDescription() -> String {
+    return enhanceStatus
+  }
+
+  /// Number of distinct frames handed to Flutter since playback started.
+  public func presentedFrames() -> Int64 {
+    presentationLock.lock()
+    defer {
+      presentationLock.unlock()
+    }
+    return presentedFrameCount
+  }
+
+  /// Forgets the presentation state, e.g. after a seek or a size change.
+  private func resetPresentation() {
+    presentationLock.lock()
+    selectedBuffer = nil
+    lastPresentedBuffer = nil
+    presentationLock.unlock()
   }
 
   public func dispose() {
     enhancer?.invalidate()
     enhancer = nil
+    resetPresentation()
     disposeMPV()
   }
 
   /// Hot-swaps the enhancement pipeline. Must be called on the render worker.
   public func setEnhancePipeline(_ configuration: VideoEnhanceConfiguration?) {
     enhanceConfiguration = configuration
+    // The frame the display link picked belongs to the old pipeline: drop it so
+    // the next tick starts from a clean state.
+    resetPresentation()
     configureEnhancer(currentSize)
   }
 
@@ -160,6 +240,7 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     NSLog("TextureGL: resize: \(size.width)x\(size.height)")
     createPixelBuffer(size)
     currentSize = size
+    resetPresentation()
     configureEnhancer(size)
   }
 
@@ -206,21 +287,30 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     guard let configuration = enhanceConfiguration else {
       enhancer?.invalidate()
       enhancer = nil
+      enhanceStatus = "disabled"
       return
     }
 
     if enhancer == nil {
-      enhancer = VideoEnhancerFactory.make(configuration: configuration)
+      var reason = ""
+      enhancer = VideoEnhancerFactory.make(
+        configuration: configuration,
+        reason: &reason
+      )
       enhancer?.onFrameAvailable = { [weak self] in
         // An enhanced frame (e.g. an interpolated one) is ready without mpv
         // having produced anything: notify Flutter without re-rendering.
         self?.notifyCallback()
       }
+      if enhancer == nil {
+        enhanceStatus = "unavailable: \(reason)"
+        NSLog("TextureHW: no enhancement pipeline available — \(reason)")
+        return
+      }
     }
 
     guard let enhancer = enhancer else {
-      NSLog("TextureHW: no enhancement pipeline available; using plain rendering")
-      self.enhancer = nil
+      enhanceStatus = "unavailable"
       return
     }
 
@@ -235,11 +325,13 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     )
 
     if !ready {
-      NSLog(
-        "TextureHW: enhancement pipeline rejected the configuration (\(configuration.anime4kProfile)); using plain rendering"
-      )
+      enhanceStatus = "rejected: \(enhancer.statusDescription)"
+      NSLog("TextureHW: \(enhanceStatus); using plain rendering")
       enhancer.invalidate()
       self.enhancer = nil
+    } else {
+      enhanceStatus = enhancer.statusDescription
+      NSLog("TextureHW: enhancement ready — \(enhanceStatus)")
     }
   }
 

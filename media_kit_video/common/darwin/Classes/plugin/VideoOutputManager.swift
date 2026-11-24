@@ -55,6 +55,17 @@ public class VideoOutputManager: NSObject {
     videoOutput!.setEnhancePipeline(configuration)
   }
 
+  /// \`["status": String, "frames": Int64]\` for diagnostics and the FPS overlay.
+  public func stats(handle: Int64) -> [String: Any] {
+    guard let videoOutput = self.videoOutputs[handle] else {
+      return ["status": "no video output", "frames": Int64(0)]
+    }
+    return [
+      "status": videoOutput.enhanceStatus(),
+      "frames": videoOutput.presentedFrames(),
+    ]
+  }
+
   public func destroy(
     handle: Int64,
     completion: @escaping () -> Void

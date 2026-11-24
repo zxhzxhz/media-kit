@@ -62,6 +62,8 @@ public class MediaKitVideoPlugin: NSObject, FlutterPlugin {
       handleDisposeMethodCall(call.arguments, result)
     case "VideoOutputManager.SetEnhancePipeline":
       handleSetEnhancePipelineMethodCall(call.arguments, result)
+    case "VideoOutputManager.GetStats":
+      handleGetStatsMethodCall(call.arguments, result)
     case "Utils.EnterNativeFullscreen":
       handleEnterNativeFullscreenMethodCall(call.arguments, result)
     case "Utils.ExitNativeFullscreen":
@@ -177,6 +179,21 @@ public class MediaKitVideoPlugin: NSObject, FlutterPlugin {
     // Acceptance only: the actual pipeline is (re)built asynchronously on the
     // render worker. Callers must tolerate a later fallback to plain rendering.
     result(true)
+  }
+
+  private func handleGetStatsMethodCall(
+    _ arguments: Any?,
+    _ result: FlutterResult
+  ) {
+    let args = arguments as? [String: Any]
+    guard let handleStr = args?["handle"] as? String,
+      let handle = Int64(handleStr)
+    else {
+      result(["status": "invalid handle", "frames": Int64(0)])
+      return
+    }
+
+    result(videoOutputManager.stats(handle: handle))
   }
 
   private func handleEnterNativeFullscreenMethodCall(

@@ -196,6 +196,24 @@ final class MetalFrameProcessor {
     return renderer != nil
   }
 
+  /// Number of compiled Anime4K passes, for the status string.
+  var enabledPassCount: Int {
+    return renderer?.enabledShaders.count ?? 0
+  }
+
+  /// Human readable state, surfaced to the enhancer's `statusDescription`.
+  var statusDescription: String {
+    var parts: [String] = []
+    parts.append(renderer != nil ? "anime4k ok" : "blit only")
+    if width > 0 && height > 0 {
+      parts.append("\(width)x\(height)")
+    }
+    if pool == nil {
+      parts.append("no pool")
+    }
+    return parts.joined(separator: ", ")
+  }
+
   // MARK: - Processing
 
   /// Runs the configured stages on \`source\` and returns a buffer taken from the

@@ -1,5 +1,7 @@
 import CoreGraphics
+import CoreMedia
 import Foundation
+import QuartzCore
 
 #if canImport(Flutter)
   import Flutter
@@ -43,6 +45,20 @@ public class VideoOutput: NSObject {
   // Kept so that the enhancement pipeline can be reconfigured at runtime
   // without recreating the texture.
   private var hardwareTexture: TextureHW?
+
+  #if os(iOS)
+    // Drives presentation when an enhancement pipeline is active: the mpv
+    // notify callback alone can not pace interpolated frames.
+    private var displayLink: CADisplayLink?
+  #endif
+  // Display link ticks are coalesced: at most one pending at a time, otherwise
+  // a slow render worker would queue them without bound.
+  private let tickLock = NSLock()
+  private var tickPending: Bool = false
+  // Playback clock sampling (see `currentPlaybackClock`).
+  private var clockBaseSeconds: Double = 0
+  private var clockBaseHostTime: CFTimeInterval = 0
+  private var clockSampleHostTime: CFTimeInterval = 0
 
   init(
     handle: Int64,
@@ -97,6 +113,7 @@ public class VideoOutput: NSObject {
   }
 
   public func dispose(completion: @escaping () -> Void) {
+    stopDisplayLink()
     // Drain rendering on its worker without blocking the platform thread,
     // which pending render jobs may still need for texture notifications.
     worker.enqueue {
@@ -107,6 +124,25 @@ public class VideoOutput: NSObject {
         completion()
       }
     }
+  }
+
+  /// Human readable enhancement state, surfaced to Dart for diagnostics.
+  public func enhanceStatus() -> String {
+    #if os(iOS)
+      return hardwareTexture?.enhanceStatusDescription()
+        ?? "unavailable (software rendering)"
+    #else
+      return "unavailable (not iOS)"
+    #endif
+  }
+
+  /// Number of distinct frames handed to Flutter since playback started.
+  public func presentedFrames() -> Int64 {
+    #if os(iOS)
+      return hardwareTexture?.presentedFrames() ?? 0
+    #else
+      return 0
+    #endif
   }
 
   private func _init() {
@@ -170,6 +206,110 @@ public class VideoOutput: NSObject {
       }
       that.registerTextureId()
     }
+
+    // The display link runs for the whole lifetime of the output: it is a no-op
+    // until an enhancement pipeline takes over presentation.
+    startDisplayLink()
+  }
+
+  // MARK: - Display link pacing
+
+  private func startDisplayLink() {
+    #if os(iOS)
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self, self.displayLink == nil, !self.disposed else {
+          return
+        }
+        let link = CADisplayLink(
+          target: self,
+          selector: #selector(self.handleDisplayTick(_:))
+        )
+        // 48~120 keeps ProMotion responsive; the value is a request, the system
+        // decides the real rate, so the pacing logic never assumes 120 Hz.
+        // The property itself is iOS 15+, the deployment target is 13.0.
+        if #available(iOS 15.0, *) {
+          link.preferredFrameRateRange = CAFrameRateRange(
+            minimum: 48,
+            maximum: 120,
+            preferred: 120
+          )
+        }
+        link.add(to: .main, forMode: .common)
+        self.displayLink = link
+      }
+    #endif
+  }
+
+  private func stopDisplayLink() {
+    #if os(iOS)
+      DispatchQueue.main.async { [weak self] in
+        self?.displayLink?.invalidate()
+        self?.displayLink = nil
+      }
+    #endif
+  }
+
+  #if os(iOS)
+    @objc private func handleDisplayTick(_ link: CADisplayLink) {
+      tickLock.lock()
+      if tickPending {
+        tickLock.unlock()
+        return
+      }
+      tickPending = true
+      tickLock.unlock()
+
+      worker.enqueue {
+        self.tickLock.lock()
+        self.tickPending = false
+        self.tickLock.unlock()
+        self._displayTick()
+      }
+    }
+  #endif
+
+  /// Picks the enhanced frame that belongs to the current playback clock and
+  /// wakes Flutter when it changed. Runs on the render worker.
+  private func _displayTick() {
+    guard !disposed else { return }
+    #if os(iOS)
+      guard let texture = hardwareTexture, texture.hasActiveEnhancer else {
+        return
+      }
+      if texture.selectFrame(at: currentPlaybackClock()) {
+        notifyOnMain()
+      }
+    #endif
+  }
+
+  /// Audio clock of the playing stream, extrapolated between samples.
+  ///
+  /// \`audio-pts\` is the real audio master clock (and the right anchor for
+  /// frame selection); \`time-pos\` is the fallback when there is no audio
+  /// track. Sampling at ~15 Hz keeps mpv property locks off the hot path.
+  private func currentPlaybackClock() -> CMTime {
+    let now = CACurrentMediaTime()
+    let needsSample = clockSampleHostTime == 0
+      || now - clockSampleHostTime > 0.066
+    if needsSample {
+      if let position = MPVHelpers.getDoubleProperty(handle, "audio-pts") {
+        clockBaseSeconds = position
+        clockBaseHostTime = now
+        clockSampleHostTime = now
+      } else if let position = MPVHelpers.getDoubleProperty(handle, "time-pos") {
+        clockBaseSeconds = position
+        clockBaseHostTime = now
+        clockSampleHostTime = now
+      } else {
+        clockSampleHostTime = now
+        return .invalid
+      }
+    }
+
+    // Clamp the extrapolation: while paused the clock does not advance, and a
+    // stale sample must not produce a runaway value.
+    let elapsed = min(max(now - clockBaseHostTime, 0), 0.5)
+    return CMTime(seconds: clockBaseSeconds + elapsed, preferredTimescale: 1000)
   }
 
   // Must be run on the main thread
@@ -208,13 +348,18 @@ public class VideoOutput: NSObject {
     }
   }
 
-  private func _notifyTexture() {
+  /// Must run on the render worker.
+  private func notifyOnMain() {
     guard !disposed else { return }
     DispatchQueue.main.sync { [weak self] in
       guard let that = self else { return }
       // Textures must be marked as available from the main thread
       that.registry.textureFrameAvailable(that.textureId)
     }
+  }
+
+  private func _notifyTexture() {
+    notifyOnMain()
   }
 
   private func _updateCallback() {
@@ -241,6 +386,18 @@ public class VideoOutput: NSObject {
     }
 
     texture.render(size)
+
+    #if os(iOS)
+      if let hardwareTexture = hardwareTexture,
+        hardwareTexture.isDrivingPresentation
+      {
+        // The display link owns presentation now. Notifying here as well would
+        // overwrite the pacing it decided and make the interpolated frames
+        // unreachable (the newest decoded frame would always win).
+        return
+      }
+    #endif
+
     _notifyTexture()
   }
 

@@ -38,6 +38,9 @@ enum VTFrameInterpolatorError: Error {
 /// type with it, so iOS 13 code can not name the class at all - not even its
 /// static members. This shim mirrors `VTFrameInterpolator.isSupported`.
 enum VTFrameInterpolationSupport {
+  private static let errorLock = NSLock()
+  private static var storedStartError: String = ""
+
   static func isSupported(width: Int, height: Int) -> Bool {
     guard width > 0, height > 0 else { return false }
     if #available(iOS 26.0, *) {
@@ -46,12 +49,87 @@ enum VTFrameInterpolationSupport {
     return false
   }
 
+  /// Human readable probe result: whether the configuration can be built for
+  /// this size, which pixel formats VideoToolbox advertises, and the error of
+  /// the last `startSession` call (if any).
+  ///
+  /// This is what turns "enhancement is enabled but nothing happens" into an
+  /// actionable message, since the failure modes of VTFrameProcessor (size
+  /// limits, unsupported formats, session errors) are otherwise invisible.
+  static func describe(width: Int, height: Int) -> String {
+    guard width > 0, height > 0 else { return "invalid size" }
+    if #available(iOS 26.0, *) {
+      return VTFrameInterpolationSupport.describe26(width: width, height: height)
+    }
+    return "needs iOS 26"
+  }
+
+  static func recordStartError(_ error: Error) {
+    errorLock.lock()
+    storedStartError = "startSession failed: \(error)"
+    errorLock.unlock()
+  }
+
+  static func lastStartError() -> String {
+    errorLock.lock()
+    defer {
+      errorLock.unlock()
+    }
+    return storedStartError
+  }
+
   @available(iOS 26.0, *)
   private static func probe(width: Int, height: Int) -> Bool {
     // A nil configuration means this size is unsupported on this hardware.
     return VTLowLatencyFrameInterpolationConfiguration(
       frameWidth: width, frameHeight: height, numberOfInterpolatedFrames: 1
     ) != nil
+  }
+
+  @available(iOS 26.0, *)
+  private static func describe26(width: Int, height: Int) -> String {
+    var parts: [String] = []
+
+    guard
+      let configuration = VTLowLatencyFrameInterpolationConfiguration(
+        frameWidth: width, frameHeight: height, numberOfInterpolatedFrames: 1
+      )
+    else {
+      parts.append("configuration rejected for \(width)x\(height)")
+      let error = lastStartError()
+      if !error.isEmpty {
+        parts.append(error)
+      }
+      return parts.joined(separator: "; ")
+    }
+    parts.append("configuration ok")
+
+    // `frameSupportedPixelFormats` is NS_REFINED_FOR_SWIFT, so the ObjC name is
+    // only reachable with the double underscore prefix in Swift.
+    parts.append(
+      "pixel formats: \(String(describing: configuration.__frameSupportedPixelFormats))"
+    )
+
+    let error = lastStartError()
+    if !error.isEmpty {
+      parts.append(error)
+    }
+    return parts.joined(separator: "; ")
+  }
+
+  private static func fourCC(_ code: OSType) -> String {
+    let bytes: [UInt8] = [
+      UInt8((code >> 24) & 0xFF),
+      UInt8((code >> 16) & 0xFF),
+      UInt8((code >> 8) & 0xFF),
+      UInt8(code & 0xFF),
+    ]
+    if bytes.allSatisfy({ $0 >= 32 && $0 < 127 }),
+      let text = String(bytes: bytes, encoding: .ascii)
+    {
+      return text
+    }
+    return "0x\(String(code, radix: 16))"
   }
 }
 
@@ -83,6 +161,9 @@ final class VTFrameInterpolator {
     do {
       try processor.startSession(configuration: configuration)
     } catch {
+      // Remember why: the caller only sees `nil` and needs the reason.
+      VTFrameInterpolationSupport.recordStartError(error)
+      NSLog("VTFrameInterpolator: startSession failed: \(error)")
       return nil
     }
     self.processor = processor

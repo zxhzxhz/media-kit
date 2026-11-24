@@ -251,6 +251,23 @@ class NativeVideoController extends PlatformVideoController {
     return result ?? false;
   }
 
+  /// Renderer diagnostics and presentation counter.
+  ///
+  /// \`status\` explains what the enhancement pipeline is doing (or why it
+  /// refused to run) and \`frames\` counts the distinct frames Flutter pulled,
+  /// which is what the FPS overlay diffs over time.
+  Future<Map<String, dynamic>> getStats() async {
+    final handle = await player.handle;
+    final result = await _channel.invokeMethod<Map<Object?, Object?>>(
+      'VideoOutputManager.GetStats',
+      {'handle': handle.toString()},
+    );
+    if (result == null) {
+      return const {};
+    }
+    return result.map((key, value) => MapEntry(key.toString(), value));
+  }
+
   /// Disposes the instance. Releases allocated resources back to the system.
   Future<void> _dispose() async {
     super.dispose();
