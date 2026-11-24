@@ -389,19 +389,27 @@ final class MetalFrameProcessor {
   }
 
   private static func makePool(width: Int, height: Int) -> CVPixelBufferPool? {
-    let attributes: [String: Any] = [
+    let bufferAttributes: [String: Any] = [
       kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
       kCVPixelBufferWidthKey as String: width,
       kCVPixelBufferHeightKey as String: height,
       kCVPixelBufferMetalCompatibilityKey as String: true,
       kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
-      kCVPixelBufferPoolMinimumBufferCountKey as String: 4,
+    ]
+    // `kCVPixelBufferPoolMinimumBufferCountKey` belongs to the *pool*
+    // attributes (second parameter). The previous version put it in the pixel
+    // buffer attributes, where it is ignored — the pool then held a single
+    // buffer, so `copyPixelBuffer` kept returning the same object,
+    // `selectedBuffer !== next` was never true, and the renderer never told
+    // Flutter a new frame was ready (status showed `sel=0` at a flat 24 fps).
+    let poolAttributes: [String: Any] = [
+      kCVPixelBufferPoolMinimumBufferCountKey as String: 6
     ]
     var pool: CVPixelBufferPool?
     let status = CVPixelBufferPoolCreate(
       kCFAllocatorDefault,
-      nil,
-      attributes as CFDictionary,
+      poolAttributes as CFDictionary,
+      bufferAttributes as CFDictionary,
       &pool
     )
     guard status == kCVReturnSuccess else {
