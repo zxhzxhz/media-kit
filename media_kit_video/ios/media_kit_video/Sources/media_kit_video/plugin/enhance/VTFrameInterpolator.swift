@@ -14,6 +14,12 @@ import CoreVideo
 import Foundation
 import VideoToolbox
 
+// VideoToolbox marks the whole VTFrameProcessor family as
+// `#if !TARGET_OS_SIMULATOR`, so none of these symbols exist in the simulator
+// SDK and the file must be excluded there. The enhancer factory falls back to
+// the Metal-only path on the simulator.
+#if !targetEnvironment(simulator)
+
 /// Failures surfaced through `VTFrameInterpolator.interpolate(...)`.
 enum VTFrameInterpolatorError: Error {
   /// No session is running: never started, or `invalidate()` was called.
@@ -150,18 +156,23 @@ final class VTFrameInterpolator {
         return
       }
 
-      // UNCERTAIN: documented with exactly these four arguments, but the frame
-      // rate conversion sibling also takes `submissionMode:`; add
-      // `.sequential` here if this initialiser turns out to require it.
-      let parameters = VTLowLatencyFrameInterpolationParameters(
-        sourceFrame: sourceFrame, previousFrame: previousFrame,
-        interpolationPhase: [0.5], destinationFrames: [destinationFrame]
-      )
+      // Four arguments, verified against
+      // VTFrameProcessor_LowLatencyFrameInterpolation.h (iOS 26.5 SDK).
+      // The initialiser is nullable, hence the guard.
+      guard
+        let parameters = VTLowLatencyFrameInterpolationParameters(
+          sourceFrame: sourceFrame,
+          previousFrame: previousFrame,
+          interpolationPhase: [0.5],
+          destinationFrames: [destinationFrame]
+        )
+      else {
+        self.finish(completion, .failure(VTFrameInterpolatorError.frameCreationFailed))
+        return
+      }
 
-      // UNCERTAIN: documented as `(VTFrameProcessorParameters?, Error?) -> Void`,
-      // yet some header dumps of the low latency variant show `(Error?) -> Void`.
-      // Types are inferred to match the first shape; on an arity mismatch replace
-      // `{ _, error in` with `{ error in`.
+      // Completion shape verified against VTFrameProcessor.h:
+      // `(VTFrameProcessorParameters?, Error?) -> Void`.
       processor.process(parameters: parameters) { _, error in
         guard let error = error else {
           self.finish(completion, .success(()))
@@ -197,3 +208,5 @@ final class VTFrameInterpolator {
     queue.async { completion(result) }
   }
 }
+
+#endif  // !targetEnvironment(simulator)

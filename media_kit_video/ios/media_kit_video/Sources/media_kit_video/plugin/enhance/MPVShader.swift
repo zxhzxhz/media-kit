@@ -158,7 +158,15 @@ kernel void \(functionName)(\(entryArgs)) {
         var shaders: [MPVShader] = []
         var current: MPVShader! = nil
         
-        let glslLines = glsl.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        // Normalize line endings first. Swift treats "\r\n" as a *single*
+        // Character (grapheme cluster), so `split(separator: "\n")` does not
+        // split a CRLF document at all and the parser silently returns zero
+        // passes. Anime4K assets checked out on Windows are CRLF, so this is
+        // not a theoretical concern.
+        let normalized = glsl
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let glslLines = normalized.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
 
         for line in glslLines {
             if line.count == 0 {

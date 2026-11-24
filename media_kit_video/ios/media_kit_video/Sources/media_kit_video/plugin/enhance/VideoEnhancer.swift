@@ -101,6 +101,10 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
 /// driven yet (that requires the CADisplayLink scheduling described in the
 /// design document), so interpolation is off by default and the caller is
 /// expected to gate it behind an explicit user opt-in.
+// The VideoToolbox frame processor family is unavailable in the simulator SDK
+// (`#if !TARGET_OS_SIMULATOR` in the headers), so this class is device only.
+#if !targetEnvironment(simulator)
+
 @available(iOS 26.0, *)
 final class IOS26VideoEnhancer: FrameEnhancerProtocol {
   private var processor: MetalFrameProcessor?
@@ -276,6 +280,8 @@ final class IOS26VideoEnhancer: FrameEnhancerProtocol {
   }
 }
 
+#endif  // !targetEnvironment(simulator)
+
 // MARK: - Factory
 
 enum VideoEnhancerFactory {
@@ -289,11 +295,13 @@ enum VideoEnhancerFactory {
       configuration.interpolation || configuration.vtScaleFactor > 0
 
     if wantsVideoToolbox {
-      if #available(iOS 26.0, *) {
-        if let enhancer = IOS26VideoEnhancer() {
-          return enhancer
+      #if !targetEnvironment(simulator)
+        if #available(iOS 26.0, *) {
+          if let enhancer = IOS26VideoEnhancer() {
+            return enhancer
+          }
         }
-      }
+      #endif
       NSLog(
         "VideoEnhancerFactory: VideoToolbox enhancement unavailable, falling back to Anime4K only"
       )

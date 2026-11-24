@@ -16,6 +16,20 @@ import Foundation
 import Metal
 
 final class MetalFrameProcessor {
+  private let device: MTLDevice
+  private let commandQueue: MTLCommandQueue
+  private let textureCache: CVMetalTextureCache
+  private let copyPipeline: MTLComputePipelineState
+  private let linearSampler: MTLSamplerState
+
+  /// Anime4K chain, nil when no shader is configured or compilation failed.
+  private var renderer: Anime4KMetalRenderer?
+  /// Pool the enhanced frames (and the VideoToolbox scratch buffers) come from.
+  private var pool: CVPixelBufferPool?
+  private var width: Int = 0
+  private var height: Int = 0
+  private var pipelineKey: String = ""
+
   /// Kicks off pipeline compilation. Returns nil when Metal is unavailable.
   init?() {
     guard let device = MTLCreateSystemDefaultDevice(),
