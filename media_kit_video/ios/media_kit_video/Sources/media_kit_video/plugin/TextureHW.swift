@@ -53,6 +53,9 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
   /// clock to the last submitted frame removes that offset entirely.
   private var clockAnchorPTS: CMTime = .invalid
   private var clockAnchorHostTime: CFTimeInterval = 0
+  /// Monotonic timestamp handed to the enhancer with each frame.
+  private var syntheticPTS: Double = 0
+  private var lastRenderHostTime: CFTimeInterval = 0
   /// Human readable state of the enhancement pipeline.
   private var enhanceStatus: String = "disabled"
 
@@ -203,6 +206,8 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     lastPresentedBuffer = nil
     clockAnchorPTS = .invalid
     clockAnchorHostTime = 0
+    syntheticPTS = 0
+    lastRenderHostTime = 0
     presentationLock.unlock()
   }
 
@@ -387,15 +392,25 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
   }
 
   private func currentPresentationTime() -> CMTime {
-    // `time-pos` can be NaN right after a seek or while paused. A CMTime built
-    // from NaN is `.invalid`, which made every timestamp check in the enhancer
-    // fail and silently stopped interpolation with no visible error.
-    if let position = MPVHelpers.getDoubleProperty(handle, "time-pos"),
-      position.isFinite
-    {
-      return CMTime(seconds: position, preferredTimescale: 1000)
+    // `time-pos` is quantised by mpv's property update rate and can return the
+    // *same* value for two consecutive frames. Identical timestamps make an
+    // interpolated frame indistinguishable from its source, so the display
+    // link keeps picking the source and the presentation rate stays at the
+    // container frame rate (24 fps with interpolation reporting success).
+    //
+    // Deriving the timestamp from the host clock delta between renders keeps
+    // every frame strictly ordered, and it shares the time base of
+    // `playbackClock()` (which advances from the same anchor).
+    let now = CACurrentMediaTime()
+    if lastRenderHostTime > 0 {
+      let delta = now - lastRenderHostTime
+      // Ignore stalls (seek, backgrounding) instead of jumping the clock.
+      if delta > 0 && delta < 0.5 {
+        syntheticPTS += delta
+      }
     }
-    return CMClockGetTime(CMClockGetHostTimeClock())
+    lastRenderHostTime = now
+    return CMTime(seconds: syntheticPTS, preferredTimescale: 1000)
   }
 
   public func render(_ size: CGSize) {

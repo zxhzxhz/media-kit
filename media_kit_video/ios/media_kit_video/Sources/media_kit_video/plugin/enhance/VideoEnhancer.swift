@@ -463,6 +463,12 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
     /// frame ordering deterministic and stops the output pool from starving.
     private func emit(_ buffer: CVPixelBuffer, at time: CMTime) {
       guard let scaler = scaler, let pool = outputPool else {
+        // An interpolated frame that came out empty must not be published: it
+        // shows up as a one-frame black flash.
+        if IOS26VideoEnhancer.isBlank(buffer) {
+          recordFailure("interpolated frame is blank")
+          return
+        }
         frames.push(EnhanceFrame(pixelBuffer: buffer, presentationTime: time))
         onFrameAvailable?()
         return
@@ -514,6 +520,16 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
         return
       }
 
+      // VT reports success but the conversion can still produce an empty
+      // frame; publishing it turns the whole picture black while audio keeps
+      // playing. Fall back to the unscaled frame instead.
+      if IOS26VideoEnhancer.isBlank(destination) {
+        recordFailure("scaled frame is blank")
+        frames.push(EnhanceFrame(pixelBuffer: buffer, presentationTime: time))
+        onFrameAvailable?()
+        return
+      }
+
       frames.push(
         EnhanceFrame(pixelBuffer: destination, presentationTime: time)
       )
@@ -532,6 +548,46 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
         "active but failing: \(width)x\(height) — \(reason) "
         + "(\(failureCount) failures)"
       NSLog("IOS26VideoEnhancer: \(baseStatus)")
+    }
+
+    /// `true` when the BGRA frame carries no visible content.
+    ///
+    /// Nine samples across the frame: a single non-zero channel means there is
+    /// real picture data. Used to reject frames the conversion pipeline left
+    /// empty even though VideoToolbox reported success.
+    private static func isBlank(_ buffer: CVPixelBuffer) -> Bool {
+      guard
+        CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA,
+        CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess
+      else {
+        return false
+      }
+      defer {
+        CVPixelBufferUnlockBaseAddress(buffer, .readOnly)
+      }
+      guard let base = CVPixelBufferGetBaseAddress(buffer) else {
+        return false
+      }
+      let width = CVPixelBufferGetWidth(buffer)
+      let height = CVPixelBufferGetHeight(buffer)
+      let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
+      guard width > 0, height > 0 else {
+        return false
+      }
+      let bytes = base.assumingMemoryBound(to: UInt8.self)
+      for row in 0..<3 {
+        for col in 0..<3 {
+          let x = width * (col * 2 + 1) / 6
+          let y = height * (row * 2 + 1) / 6
+          let offset = y * bytesPerRow + x * 4
+          if bytes[offset] != 0 || bytes[offset + 1] != 0
+            || bytes[offset + 2] != 0
+          {
+            return false
+          }
+        }
+      }
+      return true
     }
 
     private static func makePool(
