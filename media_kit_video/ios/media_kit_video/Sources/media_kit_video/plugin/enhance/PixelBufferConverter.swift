@@ -92,7 +92,7 @@ final class PixelBufferConverter {
     width: Int,
     height: Int,
     pixelFormat: OSType,
-    minBufferCount: Int = 6
+    minBufferCount: Int = 16
   ) -> CVPixelBufferPool? {
     let customAttributes: [String: Any] = [
       kCVPixelBufferPixelFormatTypeKey as String: pixelFormat,

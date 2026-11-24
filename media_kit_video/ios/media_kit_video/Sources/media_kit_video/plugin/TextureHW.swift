@@ -63,6 +63,12 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
   private var frameIntervalSeconds: Double = 1.0 / 24.0
   /// Number of times Flutter pulled a frame, for diagnostics.
   private var copyCount: Int64 = 0
+  /// `selectFrame` attempt/change counters and the last miss reason, so a
+  /// "frames are queued but nothing is ever presented" case can be diagnosed
+  /// without a Console connection.
+  private var selectAttempts: Int = 0
+  private var selectChanged: Int = 0
+  private var lastSelectMiss: String = ""
   /// Monotonic timestamp handed to the enhancer with each frame.
   private var syntheticPTS: Double = 0
   private var lastRenderHostTime: CFTimeInterval = 0
@@ -166,7 +172,16 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
   /// Returns \`true\` when the frame to present changed, so the caller knows it
   /// has to wake Flutter. Runs on the render worker.
   public func selectFrame(at clock: CMTime) -> Bool {
-    guard let enhancer = enhancer, enhancer.isActive else {
+    presentationLock.lock()
+    selectAttempts += 1
+    presentationLock.unlock()
+
+    guard let enhancer = enhancer else {
+      recordSelectMiss("no enhancer")
+      return false
+    }
+    guard enhancer.isActive else {
+      recordSelectMiss("inactive")
       return false
     }
     // Publish the newest frame instead of resolving against the clock.
@@ -179,15 +194,28 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     // exists, which is the only way it can ever be visible under a coarse
     // refresh clock.
     guard let next = enhancer.latestFrame() else {
+      recordSelectMiss("empty queue")
       return false
     }
 
     presentationLock.lock()
     let changed = selectedBuffer !== next
     selectedBuffer = next
+    if changed {
+      selectChanged += 1
+    }
     presentationLock.unlock()
 
+    if !changed {
+      recordSelectMiss("same buffer")
+    }
     return changed
+  }
+
+  private func recordSelectMiss(_ reason: String) {
+    presentationLock.lock()
+    lastSelectMiss = reason
+    presentationLock.unlock()
   }
 
   /// Presentation clock anchored to the last submitted frame.
@@ -220,13 +248,17 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     presentationLock.lock()
     let renders = renderCount
     let submits = frameIndex
+    let attempts = selectAttempts
+    let changed = selectChanged
+    let miss = lastSelectMiss
     presentationLock.unlock()
 
     var text = enhanceStatus
     if let enhancer = enhancer, enhancer.isActive {
       text = enhancer.statusDescription
     }
-    return "\(text) | renders=\(renders) submits=\(submits)"
+    return
+      "\(text) | renders=\(renders) submits=\(submits) select=\(changed)/\(attempts) miss=\(miss)"
   }
 
   /// Number of distinct frames handed to Flutter since playback started.

@@ -403,7 +403,7 @@ final class MetalFrameProcessor {
     // `selectedBuffer !== next` was never true, and the renderer never told
     // Flutter a new frame was ready (status showed `sel=0` at a flat 24 fps).
     let poolAttributes: [String: Any] = [
-      kCVPixelBufferPoolMinimumBufferCountKey as String: 6
+      kCVPixelBufferPoolMinimumBufferCountKey as String: 16
     ]
     var pool: CVPixelBufferPool?
     let status = CVPixelBufferPoolCreate(

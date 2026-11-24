@@ -21,7 +21,7 @@ import Foundation
 /// Runs Anime4K on Metal for every decoded frame.
 final class MetalOnlyEnhancer: FrameEnhancerProtocol {
   private var processor: MetalFrameProcessor?
-  private let frames = EnhanceFrameQueue(capacity: 8)
+  private let frames = EnhanceFrameQueue(capacity: 4)
   private var status: String = "Metal: idle"
 
   var onFrameAvailable: (() -> Void)?
@@ -141,7 +141,7 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
     private var outputHeight: Int = 0
     private var scaleFactor: Float = 1.0
     /// Holds [previous, current, interpolated] at most, so 4 entries are plenty.
-    private let frames = EnhanceFrameQueue(capacity: 8)
+    private let frames = EnhanceFrameQueue(capacity: 4)
 
     var onFrameAvailable: (() -> Void)?
     private(set) var isActive: Bool = false
