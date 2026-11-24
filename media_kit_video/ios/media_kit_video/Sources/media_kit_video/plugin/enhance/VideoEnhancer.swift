@@ -21,7 +21,7 @@ import Foundation
 /// Runs Anime4K on Metal for every decoded frame.
 final class MetalOnlyEnhancer: FrameEnhancerProtocol {
   private var processor: MetalFrameProcessor?
-  private let frames = EnhanceFrameQueue(capacity: 4)
+  private let frames = EnhanceFrameQueue(capacity: 8)
   private var status: String = "Metal: idle"
 
   var onFrameAvailable: (() -> Void)?
@@ -141,7 +141,7 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
     private var outputHeight: Int = 0
     private var scaleFactor: Float = 1.0
     /// Holds [previous, current, interpolated] at most, so 4 entries are plenty.
-    private let frames = EnhanceFrameQueue(capacity: 4)
+    private let frames = EnhanceFrameQueue(capacity: 8)
 
     var onFrameAvailable: (() -> Void)?
     private(set) var isActive: Bool = false
@@ -594,26 +594,15 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
       width: Int,
       height: Int
     ) -> CVPixelBufferPool? {
-      let attributes: [String: Any] = [
-        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-        kCVPixelBufferWidthKey as String: width,
-        kCVPixelBufferHeightKey as String: height,
-        kCVPixelBufferMetalCompatibilityKey as String: true,
-        kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
-        kCVPixelBufferPoolMinimumBufferCountKey as String: 4,
-      ]
-      var pool: CVPixelBufferPool?
-      let status = CVPixelBufferPoolCreate(
-        kCFAllocatorDefault,
-        nil,
-        attributes as CFDictionary,
-        &pool
+      // Route through the shared helper: it puts the minimum buffer count in
+      // the pool attributes (where it belongs) and creates the buffers with
+      // the IOSurface properties CoreImage needs for a 4K render target.
+      return PixelBufferConverter.makeResolvedPool(
+        vtAttributes: nil,
+        width: width,
+        height: height,
+        pixelFormat: kCVPixelFormatType_32BGRA
       )
-      guard status == kCVReturnSuccess else {
-        NSLog("IOS26VideoEnhancer: CVPixelBufferPoolCreate failed: \(status)")
-        return nil
-      }
-      return pool
     }
   }
 

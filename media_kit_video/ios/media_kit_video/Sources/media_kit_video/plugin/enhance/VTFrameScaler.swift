@@ -33,6 +33,8 @@ import VideoToolbox
     case timedOut
     /// BGRA <-> the VideoToolbox format conversion failed.
     case formatConversionFailed
+    /// VT reported success but the destination planes are empty.
+    case blankOutput
   }
 
   /// Availability probe callable from iOS 13 deployment targets.
@@ -235,11 +237,13 @@ import VideoToolbox
         guard
           let input = PixelBufferConverter(
             width: width, height: height,
-            pixelFormat: target, providesPool: true
+            pixelFormat: target, providesPool: true,
+            vtAttributes: configuration.sourcePixelBufferAttributes
           ),
           let destination = PixelBufferConverter(
             width: self.outputWidth, height: self.outputHeight,
-            pixelFormat: target, providesPool: true
+            pixelFormat: target, providesPool: true,
+            vtAttributes: configuration.destinationPixelBufferAttributes
           ),
           let output = PixelBufferConverter(
             width: self.outputWidth, height: self.outputHeight,
@@ -426,6 +430,15 @@ import VideoToolbox
             completion,
             .failure(VTFrameScalerError.scalingFailed(error))
           )
+          return
+        }
+
+        // Inspect the VT output *before* converting it: an unwritten 420v
+        // buffer is all zeros and converts to dark green, not black, so a
+        // BGRA-side check cannot tell it apart from real content.
+        if PixelBufferConverter.isBlankYUV(vtDestination) {
+          self.failed += 1
+          self.finish(completion, .failure(VTFrameScalerError.blankOutput))
           return
         }
 

@@ -59,6 +59,15 @@ public class VideoOutput: NSObject {
   private var clockBaseSeconds: Double = 0
   private var clockBaseHostTime: CFTimeInterval = 0
   private var clockSampleHostTime: CFTimeInterval = 0
+  // Per-second rates for diagnostics: display-link ticks, presentation
+  // changes, and how often Flutter actually pulled a texture.
+  private var tickCount: Int = 0
+  private var selectCount: Int = 0
+  private var tickRate: Int = 0
+  private var selectRate: Int = 0
+  private var copyRate: Int64 = 0
+  private var copyRateBase: Int64 = 0
+  private var lastRateReset: CFTimeInterval = 0
 
   init(
     handle: Int64,
@@ -126,11 +135,33 @@ public class VideoOutput: NSObject {
     }
   }
 
+  private func updateRatesIfNeeded() {
+    let now = CACurrentMediaTime()
+    if lastRateReset == 0 {
+      lastRateReset = now
+      return
+    }
+    guard now - lastRateReset >= 1.0 else {
+      return
+    }
+    tickRate = tickCount
+    selectRate = selectCount
+    let total = hardwareTexture?.copyCounter() ?? 0
+    copyRate = total - copyRateBase
+    copyRateBase = total
+    tickCount = 0
+    selectCount = 0
+    lastRateReset = now
+  }
+
   /// Human readable enhancement state, surfaced to Dart for diagnostics.
   public func enhanceStatus() -> String {
     #if os(iOS)
-      return hardwareTexture?.enhanceStatusDescription()
+      var text =
+        hardwareTexture?.enhanceStatusDescription()
         ?? "unavailable (software rendering)"
+      text += " | hz tick=\(tickRate) sel=\(selectRate) copy=\(copyRate)"
+      return text
     #else
       return "unavailable (not iOS)"
     #endif
@@ -270,21 +301,14 @@ public class VideoOutput: NSObject {
 
   /// Picks the enhanced frame that belongs to the current playback clock and
   /// wakes Flutter when it changed. Runs on the render worker.
+  ///
+  /// Kept for compatibility: presentation is now driven from `_updateCallback`
+  /// plus the half-frame timer, so this only maintains the tick counter that
+  /// the status line reports.
   private func _displayTick() {
     guard !disposed else { return }
-    #if os(iOS)
-      guard let texture = hardwareTexture, texture.hasActiveEnhancer else {
-        return
-      }
-      // Prefer the clock anchored to the last submitted frame: it shares the
-      // frame timestamps' time base. The mpv property based clock is only a
-      // bootstrapping fallback for the window before the first frame arrives.
-      let anchored = texture.playbackClock()
-      let clock = anchored.isValid ? anchored : currentPlaybackClock()
-      if texture.selectFrame(at: clock) {
-        notifyOnMain()
-      }
-    #endif
+    tickCount += 1
+    updateRatesIfNeeded()
   }
 
   /// Audio clock of the playing stream, extrapolated between samples.
@@ -398,17 +422,41 @@ public class VideoOutput: NSObject {
 
     #if os(iOS)
       if let hardwareTexture = hardwareTexture,
-        hardwareTexture.isDrivingPresentation
+        hardwareTexture.hasActiveEnhancer
       {
-        // The display link owns presentation now. Notifying here as well would
-        // overwrite the pacing it decided and make the interpolated frames
-        // unreachable (the newest decoded frame would always win).
+        // Present the delayed frame immediately, then the interpolated frame
+        // half a frame later. Driving this from the mpv frame callback (rather
+        // than polling a display link) means the pacing follows the decoder
+        // exactly, and a missing interpolated frame is simply skipped.
+        if hardwareTexture.selectFrame(at: hardwareTexture.playbackClock()) {
+          selectCount += 1
+          notifyOnMain()
+        }
+        scheduleHalfFrameTick(hardwareTexture)
         return
       }
     #endif
 
     _notifyTexture()
   }
+
+  #if os(iOS)
+    /// Schedules a single presentation attempt half a frame after the current
+    /// one, where the interpolated frame belongs.
+    private func scheduleHalfFrameTick(_ texture: TextureHW) {
+      let delay = texture.halfFrameInterval()
+      DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+        guard let self = self, !self.disposed else { return }
+        self.worker.enqueue {
+          guard !self.disposed else { return }
+          if texture.selectFrame(at: texture.playbackClock()) {
+            self.selectCount += 1
+            self.notifyOnMain()
+          }
+        }
+      }
+    }
+  #endif
 
     private var videoSize: CGSize {
         // fixed size

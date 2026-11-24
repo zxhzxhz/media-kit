@@ -54,8 +54,15 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
   private var clockAnchorPTS: CMTime = .invalid
   private var clockAnchorHostTime: CFTimeInterval = 0
   /// PTS of the previously submitted frame. Used as the clock anchor so
-  /// presentation runs one frame behind the decoder — see `playbackClock()`.
+  /// presentation runs behind the decoder — see `playbackClock()`.
   private var lastSubmittedPTS: CMTime = .invalid
+  /// PTS of the frame before that: presentation lags *two* frames.
+  private var previousSubmittedPTS: CMTime = .invalid
+  /// Smoothed interval between submitted frames, used to schedule the
+  /// half-frame presentation tick.
+  private var frameIntervalSeconds: Double = 1.0 / 24.0
+  /// Number of times Flutter pulled a frame, for diagnostics.
+  private var copyCount: Int64 = 0
   /// Monotonic timestamp handed to the enhancer with each frame.
   private var syntheticPTS: Double = 0
   private var lastRenderHostTime: CFTimeInterval = 0
@@ -113,9 +120,29 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
       lastPresentedBuffer = buffer
       presentedFrameCount += 1
     }
+    copyCount += 1
     presentationLock.unlock()
 
     return Unmanaged.passRetained(buffer)
+  }
+
+  /// Half the current frame interval, used to schedule the mid-frame
+  /// presentation tick.
+  public func halfFrameInterval() -> Double {
+    presentationLock.lock()
+    defer {
+      presentationLock.unlock()
+    }
+    return max(frameIntervalSeconds * 0.5, 0.004)
+  }
+
+  /// Number of `copyPixelBuffer` calls, for diagnostics.
+  public func copyCounter() -> Int64 {
+    presentationLock.lock()
+    defer {
+      presentationLock.unlock()
+    }
+    return copyCount
   }
 
   /// \`true\` once an enhancement pipeline is configured and running.
@@ -142,7 +169,16 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     guard let enhancer = enhancer, enhancer.isActive else {
       return false
     }
-    guard let next = enhancer.frame(nearestTo: clock) else {
+    // Publish the newest frame instead of resolving against the clock.
+    //
+    // Clock based selection needs the presentation clock to be frame accurate,
+    // and it is not: ProMotion throttles the whole app to the video's 24 Hz, so
+    // the half-frame tick fires before VT has produced the interpolated frame
+    // and the clock has already moved past it by the time it arrives. Taking
+    // whatever is newest means an interpolated frame is shown as soon as it
+    // exists, which is the only way it can ever be visible under a coarse
+    // refresh clock.
+    guard let next = enhancer.latestFrame() else {
       return false
     }
 
@@ -210,6 +246,9 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     clockAnchorPTS = .invalid
     clockAnchorHostTime = 0
     lastSubmittedPTS = .invalid
+    previousSubmittedPTS = .invalid
+    frameIntervalSeconds = 1.0 / 24.0
+    copyCount = 0
     syntheticPTS = 0
     lastRenderHostTime = 0
     presentationLock.unlock()
@@ -358,9 +397,12 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
         reason: &reason
       )
       enhancer?.onFrameAvailable = { [weak self] in
-        // An enhanced frame (e.g. an interpolated one) is ready without mpv
-        // having produced anything: notify Flutter without re-rendering.
-        self?.notifyCallback()
+        guard let self = self else { return }
+        // An enhanced frame (usually the interpolated one) is ready: publish it
+        // immediately. Waiting for the next mpv frame lets it be overwritten by
+        // the next source frame before it is ever shown.
+        _ = self.selectFrame(at: .invalid)
+        self.notifyCallback()
       }
       if enhancer == nil {
         enhanceStatus = "unavailable: \(reason)"
@@ -462,15 +504,32 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     if let enhancer = enhancer, enhancer.isActive {
       frameIndex += 1
       let presentationTime = currentPresentationTime()
-      // Present one frame behind the newest decoded frame. The interpolated
-      // frame sits *between* the previous and the current frame, so a clock
-      // anchored at the current frame can never reach it: `nearest` then
-      // always resolves to the source frame and the presentation rate stays at
-      // the container frame rate even though interpolation succeeds.
+      // Present two frames behind the newest decoded frame.
+      //
+      // The interpolated frame sits between the previous and the current frame.
+      // With a one-frame lag the clock reaches the midpoint only 31.25 ms into
+      // a 41.67 ms interval, so a VT pipeline that takes 32~40 ms produces the
+      // frame *after* the selection window has passed: it arrives already
+      // expired, is never selected, and nothing reports a failure. Two frames
+      // of lag give the asynchronous pipeline a full interval.
       presentationLock.lock()
-      clockAnchorPTS =
-        lastSubmittedPTS.isValid ? lastSubmittedPTS : presentationTime
+      if lastSubmittedPTS.isValid {
+        let delta = CMTimeGetSeconds(
+          CMTimeSubtract(presentationTime, lastSubmittedPTS)
+        )
+        if delta > 0.005 && delta < 0.2 {
+          frameIntervalSeconds = delta
+        }
+      }
+      if previousSubmittedPTS.isValid {
+        clockAnchorPTS = previousSubmittedPTS
+      } else if lastSubmittedPTS.isValid {
+        clockAnchorPTS = lastSubmittedPTS
+      } else {
+        clockAnchorPTS = presentationTime
+      }
       clockAnchorHostTime = CACurrentMediaTime()
+      previousSubmittedPTS = lastSubmittedPTS
       lastSubmittedPTS = presentationTime
       presentationLock.unlock()
       enhancer.submit(

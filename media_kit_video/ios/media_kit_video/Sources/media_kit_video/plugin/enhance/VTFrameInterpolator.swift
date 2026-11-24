@@ -34,6 +34,8 @@ enum VTFrameInterpolatorError: Error {
   case timedOut
   /// BGRA <-> the VideoToolbox format conversion failed.
   case formatConversionFailed
+  /// VT reported success but the destination planes are empty.
+  case blankOutput
 }
 
 /// Availability probe that is callable from iOS 13 deployment targets.
@@ -165,6 +167,9 @@ final class VTFrameInterpolator {
 
   /// BGRA -> VT format, with a pool for the converted input frames.
   private var inputConverter: PixelBufferConverter?
+  /// VT format destination pool, built from
+  /// `configuration.destinationPixelBufferAttributes`.
+  private var vtDestinationConverter: PixelBufferConverter?
   /// VT format -> BGRA, writing straight into the caller's buffer.
   private var outputConverter: PixelBufferConverter?
   /// The previous frame in VT format, reused as `previousFrame` so each frame
@@ -221,7 +226,13 @@ final class VTFrameInterpolator {
       guard
         let input = PixelBufferConverter(
           width: width, height: height,
-          pixelFormat: target, providesPool: true
+          pixelFormat: target, providesPool: true,
+          vtAttributes: configuration.sourcePixelBufferAttributes
+        ),
+        let inputDestination = PixelBufferConverter(
+          width: width, height: height,
+          pixelFormat: target, providesPool: true,
+          vtAttributes: configuration.destinationPixelBufferAttributes
         ),
         let output = PixelBufferConverter(
           width: width, height: height,
@@ -234,6 +245,7 @@ final class VTFrameInterpolator {
         return nil
       }
       self.inputConverter = input
+      self.vtDestinationConverter = inputDestination
       self.outputConverter = output
       self.canConvertPixelFormat = true
       NSLog("VTFrameInterpolator: converting BGRA <-> \(target) per frame")
@@ -342,7 +354,8 @@ final class VTFrameInterpolator {
         self.previousVTFrame = convertedSource
         self.previousVTFrameTime = sourceTime
 
-        guard let vtDestinationBuffer = inputConverter.makeBuffer() else {
+        guard let vtDestinationBuffer = self.vtDestinationConverter?.makeBuffer()
+        else {
           self.finish(
             completion,
             .failure(VTFrameInterpolatorError.formatConversionFailed)
@@ -414,6 +427,15 @@ final class VTFrameInterpolator {
         self.finish(
           completion,
           .failure(VTFrameInterpolatorError.interpolationFailed(error))
+        )
+        return
+      }
+
+      // Same reasoning as VTFrameScaler: check the 420v output directly.
+      if PixelBufferConverter.isBlankYUV(vtDestination) {
+        self.finish(
+          completion,
+          .failure(VTFrameInterpolatorError.blankOutput)
         )
         return
       }
