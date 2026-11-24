@@ -157,8 +157,6 @@ import VideoToolbox
 
     /// BGRA (source size) -> VT format.
     private var inputConverter: PixelBufferConverter?
-    /// VT format (output size) -> BGRA, writing into the caller's buffer.
-    private var outputConverter: PixelBufferConverter?
     /// Pool of VT-format destination buffers at the *output* size.
     private var vtDestinationConverter: PixelBufferConverter?
 
@@ -244,10 +242,6 @@ import VideoToolbox
             width: self.outputWidth, height: self.outputHeight,
             pixelFormat: target, providesPool: true,
             vtAttributes: configuration.destinationPixelBufferAttributes
-          ),
-          let output = PixelBufferConverter(
-            width: self.outputWidth, height: self.outputHeight,
-            pixelFormat: kCVPixelFormatType_32BGRA, providesPool: false
           )
         else {
           NSLog("VTFrameScaler: cannot set up BGRA <-> \(target) conversion")
@@ -255,7 +249,6 @@ import VideoToolbox
         }
         self.inputConverter = input
         self.vtDestinationConverter = destination
-        self.outputConverter = output
         self.canConvertPixelFormat = true
         NSLog("VTFrameScaler: converting BGRA <-> \(target) per frame")
       }
@@ -281,6 +274,12 @@ import VideoToolbox
         lock.unlock()
       }
       return processor != nil
+    }
+
+    /// A 420v buffer at the output size for VT to write into. The caller
+    /// publishes it as-is, so there is no conversion on the output side.
+    func makeDestinationBuffer() -> CVPixelBuffer? {
+      return vtDestinationConverter?.makeBuffer()
     }
 
     /// Upscales `source` into `destination`.
@@ -339,14 +338,13 @@ import VideoToolbox
         }
 
         // VT refuses BGRA: convert the source in, run the scaler in its own
-        // format, then copy the result back into the caller's BGRA buffer.
+        // The caller supplies a 420v destination (see makeDestinationBuffer()),
+        // so VT writes straight into a buffer Flutter can consume and there is
+        // no 420v -> BGRA round trip on the output side.
         var sourceBuffer = source
-        var vtDestination = destination
-        var needsBackConversion = false
+        let vtDestination = destination
 
-        if let inputConverter = self.inputConverter,
-          let vtDestinationConverter = self.vtDestinationConverter
-        {
+        if let inputConverter = self.inputConverter {
           guard let converted = inputConverter.convert(source) else {
             self.finish(
               completion,
@@ -355,16 +353,6 @@ import VideoToolbox
             return
           }
           sourceBuffer = converted
-
-          guard let vtBuffer = vtDestinationConverter.makeBuffer() else {
-            self.finish(
-              completion,
-              .failure(VTFrameScalerError.formatConversionFailed)
-            )
-            return
-          }
-          vtDestination = vtBuffer
-          needsBackConversion = true
         }
 
         guard
@@ -440,18 +428,6 @@ import VideoToolbox
           self.failed += 1
           self.finish(completion, .failure(VTFrameScalerError.blankOutput))
           return
-        }
-
-        if needsBackConversion {
-          guard let outputConverter = self.outputConverter,
-            outputConverter.convert(vtDestination, to: destination)
-          else {
-            self.finish(
-              completion,
-              .failure(VTFrameScalerError.formatConversionFailed)
-            )
-            return
-          }
         }
 
         self.succeeded += 1

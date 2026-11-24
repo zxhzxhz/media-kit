@@ -170,8 +170,6 @@ final class VTFrameInterpolator {
   /// VT format destination pool, built from
   /// `configuration.destinationPixelBufferAttributes`.
   private var vtDestinationConverter: PixelBufferConverter?
-  /// VT format -> BGRA, writing straight into the caller's buffer.
-  private var outputConverter: PixelBufferConverter?
   /// The previous frame in VT format, reused as `previousFrame` so each frame
   /// is converted once instead of twice.
   private var previousVTFrame: CVPixelBuffer?
@@ -233,10 +231,6 @@ final class VTFrameInterpolator {
           width: width, height: height,
           pixelFormat: target, providesPool: true,
           vtAttributes: configuration.destinationPixelBufferAttributes
-        ),
-        let output = PixelBufferConverter(
-          width: width, height: height,
-          pixelFormat: kCVPixelFormatType_32BGRA, providesPool: false
         )
       else {
         NSLog(
@@ -246,7 +240,6 @@ final class VTFrameInterpolator {
       }
       self.inputConverter = input
       self.vtDestinationConverter = inputDestination
-      self.outputConverter = output
       self.canConvertPixelFormat = true
       NSLog("VTFrameInterpolator: converting BGRA <-> \(target) per frame")
     }
@@ -272,6 +265,13 @@ final class VTFrameInterpolator {
     lock.lock()
     defer { lock.unlock() }
     return processor != nil
+  }
+
+  /// A 420v buffer at the frame size for VT to write the interpolated frame
+  /// into. The caller publishes it as-is, so there is no conversion on the
+  /// output side.
+  func makeDestinationBuffer() -> CVPixelBuffer? {
+    return vtDestinationConverter?.makeBuffer()
   }
 
   /// Generates one frame at phase 0.5 between `previous` and `source`, written
@@ -317,13 +317,13 @@ final class VTFrameInterpolator {
       let destinationTime = CMTimeAdd(previousTime,
                                       CMTimeMultiplyByFloat64(delta, multiplier: 0.5))
 
-      // When VT refuses BGRA, convert into its format first and back into the
-      // caller's buffer afterwards. The previous frame's converted copy is
-      // cached, so each frame is converted once instead of twice.
+      // The caller supplies a 420v destination (see makeDestinationBuffer()),
+      // so VT writes straight into a buffer Flutter can consume and there is no
+      // 420v -> BGRA round trip on the output side. Only the two input frames
+      // need converting, and the previous one is cached.
       var previousBuffer = previous
       var sourceBuffer = source
-      var vtDestination = destination
-      var needsBackConversion = false
+      let vtDestination = destination
 
       if let inputConverter = self.inputConverter {
         let convertedPrevious: CVPixelBuffer
@@ -353,17 +353,6 @@ final class VTFrameInterpolator {
         sourceBuffer = convertedSource
         self.previousVTFrame = convertedSource
         self.previousVTFrameTime = sourceTime
-
-        guard let vtDestinationBuffer = self.vtDestinationConverter?.makeBuffer()
-        else {
-          self.finish(
-            completion,
-            .failure(VTFrameInterpolatorError.formatConversionFailed)
-          )
-          return
-        }
-        vtDestination = vtDestinationBuffer
-        needsBackConversion = true
       }
 
       guard
@@ -438,19 +427,6 @@ final class VTFrameInterpolator {
           .failure(VTFrameInterpolatorError.blankOutput)
         )
         return
-      }
-
-      // Copy the interpolated frame back into the caller's BGRA buffer.
-      if needsBackConversion {
-        guard let outputConverter = self.outputConverter,
-          outputConverter.convert(vtDestination, to: destination)
-        else {
-          self.finish(
-            completion,
-            .failure(VTFrameInterpolatorError.formatConversionFailed)
-          )
-          return
-        }
       }
 
       self.succeeded += 1

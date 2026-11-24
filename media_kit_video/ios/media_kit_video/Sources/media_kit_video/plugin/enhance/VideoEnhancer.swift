@@ -155,7 +155,9 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
         return baseStatus
       }
       var parts: [String] = [baseStatus]
-      parts.append("frames=\(submittedFrames)/\(interpolateCalls)")
+      parts.append(
+        "frames=\(submittedFrames)/\(interpolateCalls) emit=\(emitCount) push=\(pushCount)"
+      )
       if let interpolator = interpolator {
         parts.append(interpolator.statsDescription)
       }
@@ -180,6 +182,13 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
     /// "submit runs but interpolation is skipped".
     private var submittedFrames: Int = 0
     private var interpolateCalls: Int = 0
+    /// BGRA -> 420v for the frames VT did not produce (the mpv frame when only
+    /// scaling is on, or when nothing is being scaled).
+    private var toVTConverter: PixelBufferConverter?
+    /// Published frame counters, so the status can tell "emit never ran" from
+    /// "emit ran but nothing was pushed".
+    private var emitCount: Int = 0
+    private var pushCount: Int = 0
 
     init?() {
       guard let processor = MetalFrameProcessor() else {
@@ -264,6 +273,16 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
         baseStatus = "Metal rejected \(width)x\(height): \(processor.statusDescription)"
         NSLog("IOS26VideoEnhancer: \(baseStatus)")
         return false
+      }
+
+      // Converts the mpv BGRA frame into the format Flutter consumes directly.
+      if toVTConverter == nil {
+        toVTConverter = PixelBufferConverter(
+          width: width,
+          height: height,
+          pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+          providesPool: true
+        )
       }
 
       if wantsScaling {
@@ -395,8 +414,8 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
       else {
         return
       }
-      guard let destination = processor.makeScratchBuffer() else {
-        recordFailure("scratch buffer pool exhausted")
+      guard let destination = interpolator.makeDestinationBuffer() else {
+        recordFailure("interpolation destination unavailable")
         return
       }
 
@@ -461,27 +480,24 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
     /// The scaler is asynchronous, but submissions are already serialised on
     /// the render worker and the wait is bounded; doing it synchronously keeps
     /// frame ordering deterministic and stops the output pool from starving.
+    /// Publishes one frame. Scaling runs first when enabled; either way the
+    /// published buffer is 420v, which Flutter's iOS engine consumes directly.
+    ///
+    /// This removes the 420v -> BGRA pass entirely. That pass was where scaling
+    /// went black: CoreImage would report success while writing nothing into a
+    /// 4K BGRA target, and a BGRA-side blank check cannot even tell an unwritten
+    /// buffer apart from content.
     private func emit(_ buffer: CVPixelBuffer, at time: CMTime) {
-      guard let scaler = scaler, let pool = outputPool else {
-        // An interpolated frame that came out empty must not be published: it
-        // shows up as a one-frame black flash.
-        if IOS26VideoEnhancer.isBlank(buffer) {
-          recordFailure("interpolated frame is blank")
-          return
-        }
-        frames.push(EnhanceFrame(pixelBuffer: buffer, presentationTime: time))
-        onFrameAvailable?()
+      emitCount += 1
+
+      guard let scaler = scaler else {
+        publish(buffer, at: time)
         return
       }
 
-      var output: CVPixelBuffer?
-      let status = CVPixelBufferPoolCreatePixelBuffer(
-        kCFAllocatorDefault,
-        pool,
-        &output
-      )
-      guard status == kCVReturnSuccess, let destination = output else {
-        recordFailure("output pool exhausted")
+      guard let destination = scaler.makeDestinationBuffer() else {
+        recordFailure("scale destination unavailable")
+        publish(buffer, at: time)
         return
       }
 
@@ -503,10 +519,7 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
 
       if semaphore.wait(timeout: .now() + 0.3) == .timedOut {
         recordFailure("scaler timed out")
-        // Fall back to the unscaled frame: leaving the previous frame on
-        // screen is what reads as a freeze or a black picture.
-        frames.push(EnhanceFrame(pixelBuffer: buffer, presentationTime: time))
-        onFrameAvailable?()
+        publish(buffer, at: time)
         return
       }
 
@@ -515,24 +528,33 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
       lock.unlock()
       if let recorded = recorded {
         recordFailure("scale: \(recorded)")
-        frames.push(EnhanceFrame(pixelBuffer: buffer, presentationTime: time))
-        onFrameAvailable?()
+        publish(buffer, at: time)
         return
       }
 
-      // VT reports success but the conversion can still produce an empty
-      // frame; publishing it turns the whole picture black while audio keeps
-      // playing. Fall back to the unscaled frame instead.
-      if IOS26VideoEnhancer.isBlank(destination) {
-        recordFailure("scaled frame is blank")
-        frames.push(EnhanceFrame(pixelBuffer: buffer, presentationTime: time))
-        onFrameAvailable?()
+      publish(destination, at: time)
+    }
+
+    /// Publishes a 420v frame. BGRA sources (the mpv frame when scaling and
+    /// interpolation are both off) are converted once; VT output is passed
+    /// through untouched.
+    private func publish(_ buffer: CVPixelBuffer, at time: CMTime) {
+      var output: CVPixelBuffer? = buffer
+      if CVPixelBufferGetPixelFormatType(buffer)
+        != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+      {
+        output = toVTConverter?.convert(buffer)
+      }
+      guard let published = output else {
+        recordFailure("output conversion failed")
         return
       }
-
-      frames.push(
-        EnhanceFrame(pixelBuffer: destination, presentationTime: time)
-      )
+      if PixelBufferConverter.isBlankYUV(published) {
+        recordFailure("published frame is blank")
+        return
+      }
+      frames.push(EnhanceFrame(pixelBuffer: published, presentationTime: time))
+      pushCount += 1
       onFrameAvailable?()
     }
 
