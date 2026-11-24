@@ -5,21 +5,22 @@
 //  VTFrameProcessor only accepts the pixel formats it advertises in
 //  `frameSupportedPixelFormats` — on an iPad Pro M4 that is `420v`
 //  (kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NV12 video range) — while
-//  the OpenGL renderer produces `32BGRA`. Every frame therefore needs one
-//  conversion in each direction. `VTPixelTransferSession` runs that on the
-//  hardware converter, so 1080p costs a few milliseconds per frame.
+//  the OpenGL renderer produces `32BGRA`.
+//
+//  `VTPixelTransferSession` was tried first: it returned noErr for the
+//  BGRA -> 420v direction yet produced a completely empty buffer on this
+//  device, which surfaced as a black picture (`scaled frame is blank`). The
+//  same conversion through CoreImage/Metal does produce valid output.
 
+import CoreImage
 import CoreVideo
 import Foundation
-import VideoToolbox
+import Metal
 
 /// Converts CVPixelBuffers between two pixel formats at a fixed size.
-///
-/// `VTPixelTransferSession` is iOS 16+; every caller lives behind the
-/// `@available(iOS 26.0, *)` VideoToolbox restriction, so gating here is enough.
 @available(iOS 16.0, *)
 final class PixelBufferConverter {
-  private let session: VTPixelTransferSession
+  private let context: CIContext
   private let pool: CVPixelBufferPool?
   private let width: Int
   private let height: Int
@@ -30,22 +31,23 @@ final class PixelBufferConverter {
   ///   format is created, so callers can obtain destination buffers cheaply.
   ///   Pass `false` when the caller always supplies its own destination.
   init?(width: Int, height: Int, pixelFormat: OSType, providesPool: Bool) {
-    guard width > 0, height > 0 else {
+    guard width > 0, height > 0,
+      let device = MTLCreateSystemDefaultDevice()
+    else {
+      NSLog("PixelBufferConverter: Metal unavailable")
       return nil
     }
 
-    var session: VTPixelTransferSession?
-    guard
-      VTPixelTransferSessionCreate(
-        allocator: kCFAllocatorDefault,
-        pixelTransferSessionOut: &session
-      ) == noErr,
-      let created = session
-    else {
-      NSLog("PixelBufferConverter: VTPixelTransferSessionCreate failed")
-      return nil
-    }
-    self.session = created
+    // No colour space conversion: the frames already carry the display's
+    // colour information and only the pixel format has to change.
+    self.context = CIContext(
+      mtlDevice: device,
+      options: [
+        .workingColorSpace: NSNull(),
+        .outputColorSpace: NSNull(),
+        .cacheIntermediates: false,
+      ]
+    )
     self.width = width
     self.height = height
     self.pixelFormat = pixelFormat
@@ -78,10 +80,6 @@ final class PixelBufferConverter {
     }
   }
 
-  deinit {
-    VTPixelTransferSessionInvalidate(session)
-  }
-
   /// Returns a pooled buffer in the target format, or `nil` on failure.
   func convert(_ source: CVPixelBuffer) -> CVPixelBuffer? {
     guard let pool = pool else {
@@ -102,17 +100,13 @@ final class PixelBufferConverter {
   }
 
   /// Converts `source` into a caller supplied buffer of the target format.
+  ///
+  /// CoreImage picks the pixel format from the destination buffer, so the same
+  /// call handles BGRA -> 420v and 420v -> BGRA.
   @discardableResult
   func convert(_ source: CVPixelBuffer, to destination: CVPixelBuffer) -> Bool {
-    let status = VTPixelTransferSessionTransferImage(
-      session,
-      from: source,
-      to: destination
-    )
-    guard status == noErr else {
-      NSLog("PixelBufferConverter: transfer failed: \(status)")
-      return false
-    }
+    let image = CIImage(cvPixelBuffer: source)
+    context.render(image, to: destination)
     return true
   }
 

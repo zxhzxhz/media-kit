@@ -53,6 +53,9 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
   /// clock to the last submitted frame removes that offset entirely.
   private var clockAnchorPTS: CMTime = .invalid
   private var clockAnchorHostTime: CFTimeInterval = 0
+  /// PTS of the previously submitted frame. Used as the clock anchor so
+  /// presentation runs one frame behind the decoder — see `playbackClock()`.
+  private var lastSubmittedPTS: CMTime = .invalid
   /// Monotonic timestamp handed to the enhancer with each frame.
   private var syntheticPTS: Double = 0
   private var lastRenderHostTime: CFTimeInterval = 0
@@ -206,6 +209,7 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     lastPresentedBuffer = nil
     clockAnchorPTS = .invalid
     clockAnchorHostTime = 0
+    lastSubmittedPTS = .invalid
     syntheticPTS = 0
     lastRenderHostTime = 0
     presentationLock.unlock()
@@ -458,12 +462,16 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     if let enhancer = enhancer, enhancer.isActive {
       frameIndex += 1
       let presentationTime = currentPresentationTime()
-      // Move the presentation clock anchor together with the frame, so the
-      // display link measures elapsed time from a timestamp it can compare
-      // against the queued frames.
+      // Present one frame behind the newest decoded frame. The interpolated
+      // frame sits *between* the previous and the current frame, so a clock
+      // anchored at the current frame can never reach it: `nearest` then
+      // always resolves to the source frame and the presentation rate stays at
+      // the container frame rate even though interpolation succeeds.
       presentationLock.lock()
-      clockAnchorPTS = presentationTime
+      clockAnchorPTS =
+        lastSubmittedPTS.isValid ? lastSubmittedPTS : presentationTime
       clockAnchorHostTime = CACurrentMediaTime()
+      lastSubmittedPTS = presentationTime
       presentationLock.unlock()
       enhancer.submit(
         textureContext!.pixelBuffer,
