@@ -32,6 +32,8 @@ enum VTFrameInterpolatorError: Error {
   case interpolationFailed(Error)
   /// `process` neither completed nor reported an error in time.
   case timedOut
+  /// BGRA <-> the VideoToolbox format conversion failed.
+  case formatConversionFailed
 }
 
 /// Availability probe that is callable from iOS 13 deployment targets.
@@ -155,9 +157,20 @@ final class VTFrameInterpolator {
   /// the property is unavailable.
   private(set) var supportedFormats: [OSType] = []
   /// `false` when the advertised formats are known and do not include the BGRA
-  /// buffers TextureHW produces; submitting them would fail or yield blank
-  /// output, so the caller must not enable interpolation.
+  /// buffers TextureHW produces.
   private(set) var acceptsBGRASource = true
+  /// `true` when BGRA <-> VT format conversion is set up, i.e. interpolation
+  /// works even though VTFrameProcessor refuses BGRA.
+  private(set) var canConvertPixelFormat = false
+
+  /// BGRA -> VT format, with a pool for the converted input frames.
+  private var inputConverter: PixelBufferConverter?
+  /// VT format -> BGRA, writing straight into the caller's buffer.
+  private var outputConverter: PixelBufferConverter?
+  /// The previous frame in VT format, reused as `previousFrame` so each frame
+  /// is converted once instead of twice.
+  private var previousVTFrame: CVPixelBuffer?
+  private var previousVTFrameTime: CMTime = .invalid
 
   private var submitted: Int = 0
   private var succeeded: Int = 0
@@ -187,6 +200,34 @@ final class VTFrameInterpolator {
     self.supportedFormats = formats
     if !formats.isEmpty {
       self.acceptsBGRASource = formats.contains(kCVPixelFormatType_32BGRA)
+    }
+
+    if !self.acceptsBGRASource {
+      // VideoToolbox advertises a format the renderer does not produce (on
+      // iPad Pro M4 it only accepts 420v). Convert instead of giving up.
+      guard let target = formats.first else {
+        NSLog("VTFrameInterpolator: VT advertises no usable pixel format")
+        return nil
+      }
+      guard
+        let input = PixelBufferConverter(
+          width: width, height: height,
+          pixelFormat: target, providesPool: true
+        ),
+        let output = PixelBufferConverter(
+          width: width, height: height,
+          pixelFormat: kCVPixelFormatType_32BGRA, providesPool: false
+        )
+      else {
+        NSLog(
+          "VTFrameInterpolator: cannot set up BGRA <-> \(target) conversion"
+        )
+        return nil
+      }
+      self.inputConverter = input
+      self.outputConverter = output
+      self.canConvertPixelFormat = true
+      NSLog("VTFrameInterpolator: converting BGRA <-> \(target) per frame")
     }
 
     // UNCERTAIN: assumes the no-argument `VTFrameProcessor()` initialiser.
@@ -255,15 +296,66 @@ final class VTFrameInterpolator {
       let destinationTime = CMTimeAdd(previousTime,
                                       CMTimeMultiplyByFloat64(delta, multiplier: 0.5))
 
+      // When VT refuses BGRA, convert into its format first and back into the
+      // caller's buffer afterwards. The previous frame's converted copy is
+      // cached, so each frame is converted once instead of twice.
+      var previousBuffer = previous
+      var sourceBuffer = source
+      var vtDestination = destination
+      var needsBackConversion = false
+
+      if let inputConverter = self.inputConverter {
+        let convertedPrevious: CVPixelBuffer
+        if let cached = self.previousVTFrame,
+          CMTimeCompare(self.previousVTFrameTime, previousTime) == 0
+        {
+          convertedPrevious = cached
+        } else {
+          guard let converted = inputConverter.convert(previous) else {
+            self.failed += 1
+            self.finish(
+              completion,
+              .failure(VTFrameInterpolatorError.formatConversionFailed)
+            )
+            return
+          }
+          convertedPrevious = converted
+        }
+        previousBuffer = convertedPrevious
+
+        guard let convertedSource = inputConverter.convert(source) else {
+          self.failed += 1
+          self.finish(
+            completion,
+            .failure(VTFrameInterpolatorError.formatConversionFailed)
+          )
+          return
+        }
+        sourceBuffer = convertedSource
+        self.previousVTFrame = convertedSource
+        self.previousVTFrameTime = sourceTime
+
+        guard let vtDestinationBuffer = inputConverter.makeBuffer() else {
+          self.failed += 1
+          self.finish(
+            completion,
+            .failure(VTFrameInterpolatorError.formatConversionFailed)
+          )
+          return
+        }
+        vtDestination = vtDestinationBuffer
+        needsBackConversion = true
+      }
+
       guard
         let previousFrame = VTFrameProcessorFrame(
-          buffer: previous, presentationTimeStamp: previousTime
+          buffer: previousBuffer, presentationTimeStamp: previousTime
         ),
         let sourceFrame = VTFrameProcessorFrame(
-          buffer: source, presentationTimeStamp: sourceTime
+          buffer: sourceBuffer, presentationTimeStamp: sourceTime
         ),
         let destinationFrame = VTFrameProcessorFrame(
-          buffer: destination, presentationTimeStamp: destinationTime
+          buffer: vtDestination, presentationTimeStamp: destinationTime
         )
       else {
         self.finish(completion, .failure(VTFrameInterpolatorError.frameCreationFailed))
@@ -318,10 +410,25 @@ final class VTFrameInterpolator {
           completion,
           .failure(VTFrameInterpolatorError.interpolationFailed(error))
         )
-      } else {
-        self.succeeded += 1
-        self.finish(completion, .success(()))
+        return
       }
+
+      // Copy the interpolated frame back into the caller's BGRA buffer.
+      if needsBackConversion {
+        guard let outputConverter = self.outputConverter,
+          outputConverter.convert(vtDestination, to: destination)
+        else {
+          self.failed += 1
+          self.finish(
+            completion,
+            .failure(VTFrameInterpolatorError.formatConversionFailed)
+          )
+          return
+        }
+      }
+
+      self.succeeded += 1
+      self.finish(completion, .success(()))
     }
   }
 

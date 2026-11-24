@@ -1,6 +1,7 @@
 import CoreMedia
 import Flutter
 import OpenGLES
+import QuartzCore
 
 #if SWIFT_PACKAGE
   import Mpv
@@ -38,6 +39,17 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
   /// Last buffer handed to Flutter, used to count *distinct* presented frames.
   private var lastPresentedBuffer: CVPixelBuffer?
   private var presentedFrameCount: Int64 = 0
+  /// Anchor for the presentation clock: the PTS of the most recent frame handed
+  /// to the enhancer, plus the host time at which that happened.
+  ///
+  /// Sampling `time-pos` at display-link time and comparing it against frame
+  /// timestamps taken at render time mixes two different instants: the clock
+  /// always reads up to one frame interval *ahead* of the frame it belongs to,
+  /// so `nearest` kept picking the newest queued frame and the interpolated one
+  /// was never shown (interpolation "active" at a flat 24 fps). Anchoring the
+  /// clock to the last submitted frame removes that offset entirely.
+  private var clockAnchorPTS: CMTime = .invalid
+  private var clockAnchorHostTime: CFTimeInterval = 0
   /// Human readable state of the enhancement pipeline.
   private var enhanceStatus: String = "disabled"
 
@@ -133,6 +145,27 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     return changed
   }
 
+  /// Presentation clock anchored to the last submitted frame.
+  ///
+  /// This is the clock the display link should use: it advances in the same
+  /// time base as the frame timestamps, so the frame picked for a given instant
+  /// is the one that actually belongs there.
+  public func playbackClock() -> CMTime {
+    presentationLock.lock()
+    let anchor = clockAnchorPTS
+    let hostTime = clockAnchorHostTime
+    presentationLock.unlock()
+
+    guard anchor.isValid, hostTime > 0 else {
+      return .invalid
+    }
+    let elapsed = min(max(CACurrentMediaTime() - hostTime, 0), 0.12)
+    return CMTimeAdd(
+      anchor,
+      CMTime(seconds: elapsed, preferredTimescale: 1000)
+    )
+  }
+
   /// Human readable enhancement state (see \`FrameEnhancerProtocol.statusDescription\`).
   public func enhanceStatusDescription() -> String {
     return enhanceStatus
@@ -152,6 +185,8 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     presentationLock.lock()
     selectedBuffer = nil
     lastPresentedBuffer = nil
+    clockAnchorPTS = .invalid
+    clockAnchorHostTime = 0
     presentationLock.unlock()
   }
 
@@ -385,9 +420,17 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     // documented to copy whatever it needs, so the GL buffer can be recycled.
     if let enhancer = enhancer, enhancer.isActive {
       frameIndex += 1
+      let presentationTime = currentPresentationTime()
+      // Move the presentation clock anchor together with the frame, so the
+      // display link measures elapsed time from a timestamp it can compare
+      // against the queued frames.
+      presentationLock.lock()
+      clockAnchorPTS = presentationTime
+      clockAnchorHostTime = CACurrentMediaTime()
+      presentationLock.unlock()
       enhancer.submit(
         textureContext!.pixelBuffer,
-        presentationTime: currentPresentationTime(),
+        presentationTime: presentationTime,
         frameIndex: frameIndex
       )
     }

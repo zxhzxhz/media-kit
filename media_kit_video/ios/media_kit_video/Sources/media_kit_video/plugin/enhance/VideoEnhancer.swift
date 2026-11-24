@@ -293,10 +293,10 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
           return false
         }
         self.scaler = scaler
-        if !scaler.acceptsBGRASource {
+        if !scaler.acceptsBGRASource && !scaler.canConvertPixelFormat {
           baseStatus =
-            "scaler rejects BGRA \(width)x\(height) — advertised formats "
-            + "\(scaler.supportedFormats.map { String($0) }.joined(separator: ","))"
+            "scaler needs BGRA conversion but VTPixelTransferSession is "
+            + "unavailable \(width)x\(height)"
           NSLog("IOS26VideoEnhancer: \(baseStatus)")
           return false
         }
@@ -317,10 +317,11 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
           return false
         }
         self.interpolator = interpolator
-        if !interpolator.acceptsBGRASource {
+        if !interpolator.acceptsBGRASource && !interpolator.canConvertPixelFormat
+        {
           baseStatus =
-            "interpolation rejects BGRA \(width)x\(height) — advertised "
-            + "formats \(interpolator.supportedFormats.map { String($0) }.joined(separator: ","))"
+            "interpolation needs BGRA conversion but VTPixelTransferSession is "
+            + "unavailable \(width)x\(height)"
           NSLog("IOS26VideoEnhancer: \(baseStatus)")
           return false
         }
@@ -341,8 +342,14 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
         wantsInterpolation ? "interp 2x" : nil,
         wantsScaling ? "scale \(requestedScale)x" : nil,
       ].compactMap { $0 }.joined(separator: " + ")
+      // Call out the conversion: VT only accepts 420v on this hardware, so the
+      // frames go through VTPixelTransferSession in both directions.
+      let conversion =
+        (interpolator?.canConvertPixelFormat == true
+          || scaler?.canConvertPixelFormat == true)
+        ? " [420v conv]" : ""
       baseStatus =
-        "active: \(stages) \(width)x\(height) → \(outputWidth)x\(outputHeight), "
+        "active: \(stages)\(conversion) \(width)x\(height) → \(outputWidth)x\(outputHeight), "
         + "anime4k \(wantsScaling ? "off" : configuration.anime4kProfile)"
       NSLog("IOS26VideoEnhancer: \(baseStatus)")
       return true

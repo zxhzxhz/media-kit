@@ -276,7 +276,12 @@ public class VideoOutput: NSObject {
       guard let texture = hardwareTexture, texture.hasActiveEnhancer else {
         return
       }
-      if texture.selectFrame(at: currentPlaybackClock()) {
+      // Prefer the clock anchored to the last submitted frame: it shares the
+      // frame timestamps' time base. The mpv property based clock is only a
+      // bootstrapping fallback for the window before the first frame arrives.
+      let anchored = texture.playbackClock()
+      let clock = anchored.isValid ? anchored : currentPlaybackClock()
+      if texture.selectFrame(at: clock) {
         notifyOnMain()
       }
     #endif

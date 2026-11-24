@@ -31,6 +31,8 @@ import VideoToolbox
     case scalingFailed(Error)
     /// `process` neither completed nor reported an error in time.
     case timedOut
+    /// BGRA <-> the VideoToolbox format conversion failed.
+    case formatConversionFailed
   }
 
   /// Availability probe callable from iOS 13 deployment targets.
@@ -148,6 +150,15 @@ import VideoToolbox
     private(set) var supportedFormats: [OSType] = []
     /// `false` when the advertised formats are known and do not include BGRA.
     private(set) var acceptsBGRASource = true
+    /// `true` when BGRA <-> VT format conversion is set up.
+    private(set) var canConvertPixelFormat = false
+
+    /// BGRA (source size) -> VT format.
+    private var inputConverter: PixelBufferConverter?
+    /// VT format (output size) -> BGRA, writing into the caller's buffer.
+    private var outputConverter: PixelBufferConverter?
+    /// Pool of VT-format destination buffers at the *output* size.
+    private var vtDestinationConverter: PixelBufferConverter?
 
     private var submitted: Int = 0
     private var succeeded: Int = 0
@@ -205,6 +216,36 @@ import VideoToolbox
       self.supportedFormats = formats
       if !formats.isEmpty {
         self.acceptsBGRASource = formats.contains(kCVPixelFormatType_32BGRA)
+      }
+
+      if !self.acceptsBGRASource {
+        // VT wants a format the renderer does not produce; convert in and out.
+        guard let target = formats.first else {
+          NSLog("VTFrameScaler: VT advertises no usable pixel format")
+          return nil
+        }
+        guard
+          let input = PixelBufferConverter(
+            width: width, height: height,
+            pixelFormat: target, providesPool: true
+          ),
+          let destination = PixelBufferConverter(
+            width: self.outputWidth, height: self.outputHeight,
+            pixelFormat: target, providesPool: true
+          ),
+          let output = PixelBufferConverter(
+            width: self.outputWidth, height: self.outputHeight,
+            pixelFormat: kCVPixelFormatType_32BGRA, providesPool: false
+          )
+        else {
+          NSLog("VTFrameScaler: cannot set up BGRA <-> \(target) conversion")
+          return nil
+        }
+        self.inputConverter = input
+        self.vtDestinationConverter = destination
+        self.outputConverter = output
+        self.canConvertPixelFormat = true
+        NSLog("VTFrameScaler: converting BGRA <-> \(target) per frame")
       }
 
       let processor = VTFrameProcessor()
@@ -285,9 +326,40 @@ import VideoToolbox
           return
         }
 
+        // VT refuses BGRA: convert the source in, run the scaler in its own
+        // format, then copy the result back into the caller's BGRA buffer.
+        var sourceBuffer = source
+        var vtDestination = destination
+        var needsBackConversion = false
+
+        if let inputConverter = self.inputConverter,
+          let vtDestinationConverter = self.vtDestinationConverter
+        {
+          guard let converted = inputConverter.convert(source) else {
+            self.failed += 1
+            self.finish(
+              completion,
+              .failure(VTFrameScalerError.formatConversionFailed)
+            )
+            return
+          }
+          sourceBuffer = converted
+
+          guard let vtBuffer = vtDestinationConverter.makeBuffer() else {
+            self.failed += 1
+            self.finish(
+              completion,
+              .failure(VTFrameScalerError.formatConversionFailed)
+            )
+            return
+          }
+          vtDestination = vtBuffer
+          needsBackConversion = true
+        }
+
         guard
           let sourceFrame = VTFrameProcessorFrame(
-            buffer: source,
+            buffer: sourceBuffer,
             presentationTimeStamp: sourceTime.isValid ? sourceTime : .zero
           )
         else {
@@ -299,7 +371,7 @@ import VideoToolbox
         }
         guard
           let destinationFrame = VTFrameProcessorFrame(
-            buffer: destination,
+            buffer: vtDestination,
             presentationTimeStamp: sourceTime.isValid ? sourceTime : .zero
           )
         else {
@@ -351,6 +423,20 @@ import VideoToolbox
           )
           return
         }
+
+        if needsBackConversion {
+          guard let outputConverter = self.outputConverter,
+            outputConverter.convert(vtDestination, to: destination)
+          else {
+            self.failed += 1
+            self.finish(
+              completion,
+              .failure(VTFrameScalerError.formatConversionFailed)
+            )
+            return
+          }
+        }
+
         self.succeeded += 1
         self.finish(completion, .success(()))
       }
