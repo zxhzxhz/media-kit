@@ -31,6 +31,9 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
   private var currentSize: CGSize = .zero
   /// Monotonic frame counter, exposed to the enhancer for logging/ordering.
   private var frameIndex: Int64 = 0
+  /// How many times `render` ran, so the status can tell "mpv never delivered a
+  /// frame" from "frames arrive but the enhancer skips them".
+  private var renderCount: Int64 = 0
   /// Frame the display link picked for the current clock. Guarded by
   /// \`presentationLock\` because the render worker writes it while the Flutter
   /// raster thread reads it from \`copyPixelBuffer\`.
@@ -168,7 +171,20 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
 
   /// Human readable enhancement state (see \`FrameEnhancerProtocol.statusDescription\`).
   public func enhanceStatusDescription() -> String {
-    return enhanceStatus
+    // Read live instead of returning the string captured in
+    // `configureEnhancer`: a cached snapshot made every counter look frozen at
+    // its configure-time value, hiding the difference between "never
+    // submitted" and "submitted but skipped".
+    presentationLock.lock()
+    let renders = renderCount
+    let submits = frameIndex
+    presentationLock.unlock()
+
+    var text = enhanceStatus
+    if let enhancer = enhancer, enhancer.isActive {
+      text = enhancer.statusDescription
+    }
+    return "\(text) | renders=\(renders) submits=\(submits)"
   }
 
   /// Number of distinct frames handed to Flutter since playback started.
@@ -371,9 +387,12 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
   }
 
   private func currentPresentationTime() -> CMTime {
-    // \`time-pos\` is the playback position mpv is showing. It is a far better
-    // anchor than a wall clock because it survives seeks and rate changes.
-    if let position = MPVHelpers.getDoubleProperty(handle, "time-pos") {
+    // `time-pos` can be NaN right after a seek or while paused. A CMTime built
+    // from NaN is `.invalid`, which made every timestamp check in the enhancer
+    // fail and silently stopped interpolation with no visible error.
+    if let position = MPVHelpers.getDoubleProperty(handle, "time-pos"),
+      position.isFinite
+    {
       return CMTime(seconds: position, preferredTimescale: 1000)
     }
     return CMClockGetTime(CMClockGetHostTimeClock())
@@ -381,6 +400,9 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
 
   public func render(_ size: CGSize) {
     guard renderContext != nil else { return }
+    presentationLock.lock()
+    renderCount += 1
+    presentationLock.unlock()
     let textureContext = textureContexts.nextAvailable()
     if textureContext == nil {
       return

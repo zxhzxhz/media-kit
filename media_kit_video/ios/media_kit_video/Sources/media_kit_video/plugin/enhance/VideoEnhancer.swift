@@ -342,6 +342,8 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
       submittedCount = 0
       failureCount = 0
       lastFailure = ""
+      submittedFrames = 0
+      interpolateCalls = 0
       isActive = true
 
       let stages = [
