@@ -215,22 +215,26 @@ final class VTFrameInterpolator {
     }
 
     if !self.acceptsBGRASource {
-      // VideoToolbox advertises a format the renderer does not produce (on
-      // iPad Pro M4 it only accepts 420v). Convert instead of giving up.
-      guard let target = formats.first else {
-        NSLog("VTFrameInterpolator: VT advertises no usable pixel format")
+      // The destination pool is required regardless of whether VT accepts
+      // BGRA: the caller allocates from it (see makeDestinationBuffer).
+      let target: OSType = formats.first ?? kCVPixelFormatType_32BGRA
+      guard
+        let inputDestination = PixelBufferConverter(
+          width: width, height: height,
+          pixelFormat: target, providesPool: true,
+          vtAttributes: configuration.destinationPixelBufferAttributes
+        )
+      else {
+        NSLog("VTFrameInterpolator: cannot create the destination pool")
         return nil
       }
+      self.vtDestinationConverter = inputDestination
+
       guard
         let input = PixelBufferConverter(
           width: width, height: height,
           pixelFormat: target, providesPool: true,
           vtAttributes: configuration.sourcePixelBufferAttributes
-        ),
-        let inputDestination = PixelBufferConverter(
-          width: width, height: height,
-          pixelFormat: target, providesPool: true,
-          vtAttributes: configuration.destinationPixelBufferAttributes
         )
       else {
         NSLog(
@@ -239,7 +243,6 @@ final class VTFrameInterpolator {
         return nil
       }
       self.inputConverter = input
-      self.vtDestinationConverter = inputDestination
       self.canConvertPixelFormat = true
       NSLog("VTFrameInterpolator: converting BGRA <-> \(target) per frame")
     }

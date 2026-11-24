@@ -226,31 +226,41 @@ import VideoToolbox
         self.acceptsBGRASource = formats.contains(kCVPixelFormatType_32BGRA)
       }
 
+      // The destination pool is required regardless of whether VT accepts
+      // BGRA: the caller allocates the output buffer from it (see
+      // makeDestinationBuffer). Creating it only in the conversion branch left
+      // it nil whenever VT advertised BGRA, so every scaled frame fell back
+      // with "scale destination unavailable".
+      let targetFormat = formats.first ?? kCVPixelFormatType_32BGRA
+      guard
+        let destination = PixelBufferConverter(
+          width: self.outputWidth, height: self.outputHeight,
+          pixelFormat: targetFormat, providesPool: true,
+          vtAttributes: configuration.destinationPixelBufferAttributes
+        )
+      else {
+        NSLog("VTFrameScaler: cannot create the destination pool")
+        return nil
+      }
+      self.vtDestinationConverter = destination
+
       if !self.acceptsBGRASource {
-        // VT wants a format the renderer does not produce; convert in and out.
-        guard let target = formats.first else {
-          NSLog("VTFrameScaler: VT advertises no usable pixel format")
-          return nil
-        }
+        // VT wants a format the renderer does not produce; convert the source.
         guard
           let input = PixelBufferConverter(
             width: width, height: height,
-            pixelFormat: target, providesPool: true,
+            pixelFormat: targetFormat, providesPool: true,
             vtAttributes: configuration.sourcePixelBufferAttributes
-          ),
-          let destination = PixelBufferConverter(
-            width: self.outputWidth, height: self.outputHeight,
-            pixelFormat: target, providesPool: true,
-            vtAttributes: configuration.destinationPixelBufferAttributes
           )
         else {
-          NSLog("VTFrameScaler: cannot set up BGRA <-> \(target) conversion")
+          NSLog(
+            "VTFrameScaler: cannot set up BGRA <-> \(targetFormat) conversion"
+          )
           return nil
         }
         self.inputConverter = input
-        self.vtDestinationConverter = destination
         self.canConvertPixelFormat = true
-        NSLog("VTFrameScaler: converting BGRA <-> \(target) per frame")
+        NSLog("VTFrameScaler: converting BGRA <-> \(targetFormat) per frame")
       }
 
       let processor = VTFrameProcessor()
