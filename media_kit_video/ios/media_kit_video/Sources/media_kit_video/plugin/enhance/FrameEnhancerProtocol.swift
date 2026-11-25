@@ -34,9 +34,30 @@ final class EnhanceFrameQueue {
     self.capacity = max(2, capacity)
   }
 
+  /// Inserts a frame ordered by presentation time.
+  ///
+  /// Ordering matters because the pipeline is out of order by construction: the
+  /// decoded frame `F(n)` is pushed synchronously, while the interpolated frame
+  /// `F(n-0.5)` is pushed later from the VideoToolbox completion. Appending
+  /// (the old behaviour) put a frame that belongs *before* the current one at
+  /// the tail, so `latest()` handed the renderer a frame that ran the timeline
+  /// backwards.
+  ///
+  /// Inserting by PTS lets the interpolated frame land between `F(n-1)` and
+  /// `F(n)` where it belongs, which is what `nearest(to:)` needs to pick it at
+  /// the half frame boundary.
   func push(_ frame: EnhanceFrame) {
     lock.lock()
-    storage.append(frame)
+    var index = storage.endIndex
+    if frame.presentationTime.isValid {
+      index =
+        storage.firstIndex { existing in
+          guard existing.presentationTime.isValid else { return true }
+          return CMTimeCompare(
+            existing.presentationTime, frame.presentationTime) > 0
+        } ?? storage.endIndex
+    }
+    storage.insert(frame, at: index)
     while storage.count > capacity {
       storage.removeFirst()
     }
@@ -45,12 +66,39 @@ final class EnhanceFrameQueue {
 
   /// Returns the newest frame without consuming it, so a single frame can be
   /// pulled by multiple Flutter raster passes.
+  ///
+  /// The queue is kept sorted, so the newest frame is also the one with the
+  /// highest presentation time.
   func latest() -> EnhanceFrame? {
     lock.lock()
     defer {
       lock.unlock()
     }
     return storage.last
+  }
+
+  /// Returns the frame with the **highest presentation time**, regardless of
+  /// push order.
+  func newest() -> EnhanceFrame? {
+    lock.lock()
+    defer {
+      lock.unlock()
+    }
+    guard let first = storage.first else {
+      return nil
+    }
+    var best = first
+    for frame in storage.dropFirst() {
+      guard frame.presentationTime.isValid else {
+        continue
+      }
+      if !best.presentationTime.isValid
+        || CMTimeCompare(frame.presentationTime, best.presentationTime) > 0
+      {
+        best = frame
+      }
+    }
+    return best
   }
 
   /// Returns the frame whose presentation time is closest to `time`.
@@ -129,13 +177,13 @@ protocol FrameEnhancerProtocol: AnyObject {
   /// `true` when the pipeline is configured and able to produce frames.
   var isActive: Bool { get }
 
+  /// `true` when the pipeline synthesizes intermediate frames and needs a
+  /// mid-frame presentation tick.
+  var producesInterpolatedFrames: Bool { get }
+
   /// Human readable state, surfaced to Dart so that "enhancement is on but
   /// nothing happens" becomes diagnosable from inside the app.
   var statusDescription: String { get }
-
-  /// Invoked (on an internal queue) whenever a new frame becomes available
-  /// asynchronously. `TextureHW` uses it to notify Flutter.
-  var onFrameAvailable: (() -> Void)? { get set }
 
   /// Builds or rebuilds the pipeline. Returns `false` when the device cannot
   /// run the requested pipeline, in which case the caller must fall back to the
@@ -164,9 +212,19 @@ protocol FrameEnhancerProtocol: AnyObject {
   /// Newest enhanced frame, or `nil` when nothing is ready yet.
   func latestFrame() -> CVPixelBuffer?
 
+  /// Frame with the highest presentation time. Used by the renderer while
+  /// presentation has to stay monotonic (see `EnhanceFrameQueue.newest()`).
+  func newestFrame() -> CVPixelBuffer?
+
+  /// Frame with the highest presentation time, including its timestamp.
+  func newestEnhanceFrame() -> EnhanceFrame?
+
   /// Frame whose presentation time is closest to `time`. Used by the display
   /// link to present the right frame for the current clock.
   func frame(nearestTo time: CMTime) -> CVPixelBuffer?
+
+  /// Frame whose presentation time is closest to `time`, including its timestamp.
+  func enhanceFrame(nearestTo time: CMTime) -> EnhanceFrame?
 
   /// Releases every resource. Safe to call more than once.
   func invalidate()

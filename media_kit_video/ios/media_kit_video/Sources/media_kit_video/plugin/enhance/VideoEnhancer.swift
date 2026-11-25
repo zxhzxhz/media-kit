@@ -24,8 +24,11 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
   private let frames = EnhanceFrameQueue(capacity: 4)
   private var status: String = "Metal: idle"
 
-  var onFrameAvailable: (() -> Void)?
   private(set) var isActive: Bool = false
+
+  var producesInterpolatedFrames: Bool {
+    return false
+  }
 
   var statusDescription: String {
     return status
@@ -97,15 +100,28 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
     frames.push(
       EnhanceFrame(pixelBuffer: output, presentationTime: presentationTime)
     )
-    onFrameAvailable?()
+    // No notification: `VideoOutput` drives presentation from the mpv frame
+    // callback, so the enqueue is enough.
   }
 
   func latestFrame() -> CVPixelBuffer? {
     return frames.latest()?.pixelBuffer
   }
 
+  func newestFrame() -> CVPixelBuffer? {
+    return frames.newest()?.pixelBuffer
+  }
+
+  func newestEnhanceFrame() -> EnhanceFrame? {
+    return frames.newest()
+  }
+
   func frame(nearestTo time: CMTime) -> CVPixelBuffer? {
     return frames.nearest(to: time)?.pixelBuffer
+  }
+
+  func enhanceFrame(nearestTo time: CMTime) -> EnhanceFrame? {
+    return frames.nearest(to: time)
   }
 
   func invalidate() {
@@ -135,37 +151,67 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
     private var processor: MetalFrameProcessor?
     private var interpolator: VTFrameInterpolator?
     private var scaler: VTFrameScaler?
-    /// Output size pool, only allocated when VT scaling is requested.
-    private var outputPool: CVPixelBufferPool?
     private var outputWidth: Int = 0
     private var outputHeight: Int = 0
     private var scaleFactor: Float = 1.0
-    /// Holds [previous, current, interpolated] at most, so 4 entries are plenty.
-    private let frames = EnhanceFrameQueue(capacity: 4)
+    /// Holds [F(n-2), F(n-1.5), F(n-1), F(n-0.5), F(n)] plus slack for the
+    /// two frame presentation lag: 4 was too tight once extraction and
+    /// interpolation both publish into the same queue.
+    private let frames = EnhanceFrameQueue(capacity: 8)
 
-    var onFrameAvailable: (() -> Void)?
-    private(set) var isActive: Bool = false
+    private var _isActive: Bool = false
+    var isActive: Bool {
+      stateLock.lock()
+      defer { stateLock.unlock() }
+      return _isActive
+    }
+
+    var producesInterpolatedFrames: Bool {
+      stateLock.lock()
+      defer { stateLock.unlock() }
+      return interpolator != nil
+    }
+
     private var baseStatus: String = "VideoToolbox: idle"
 
     /// Includes the live submission counters, so the FPS overlay can show
     /// whether VT is actually producing frames (`ok` growing) or stalling
     /// (`to` / `fail` growing) without a Console connection.
     var statusDescription: String {
-      guard isActive else {
-        return baseStatus
+      stateLock.lock()
+      let active = _isActive
+      let base = baseStatus
+      let sub = submittedFrames
+      let icall = interpolateCalls
+      let em = emitCount
+      let pu = pushCount
+      let pSrc = pushSrc
+      let eSrc = emitSrc
+      let pInt = pushInterp
+      let eInt = emitInterp
+      let fail = failureCount
+      let interp = interpolator
+      let scl = scaler
+      stateLock.unlock()
+
+      guard active else {
+        return base
       }
-      var parts: [String] = [baseStatus]
+      var parts: [String] = [base]
       parts.append(
-        "frames=\(submittedFrames)/\(interpolateCalls) emit=\(emitCount) push=\(pushCount)"
+        "frames=\(sub)/\(icall) emit=\(em) push=\(pu)"
       )
-      if let interpolator = interpolator {
-        parts.append(interpolator.statsDescription)
+      parts.append(
+        "src=\(pSrc)/\(eSrc) interp=\(pInt)/\(eInt)"
+      )
+      if let interp = interp {
+        parts.append(interp.statsDescription)
       }
-      if let scaler = scaler {
-        parts.append(scaler.statsDescription)
+      if let scl = scl {
+        parts.append(scl.statsDescription)
       }
-      if failureCount > 0 {
-        parts.append("emitFail=\(failureCount)")
+      if fail > 0 {
+        parts.append("emitFail=\(fail)")
       }
       return parts.joined(separator: " | ")
     }
@@ -182,13 +228,32 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
     /// "submit runs but interpolation is skipped".
     private var submittedFrames: Int = 0
     private var interpolateCalls: Int = 0
-    /// BGRA -> 420v for the frames VT did not produce (the mpv frame when only
-    /// scaling is on, or when nothing is being scaled).
-    private var toVTConverter: PixelBufferConverter?
+    /// 420v -> 32BGRA for interpolated frames when VT scaling is disabled, so
+    /// every published frame reaches Flutter as untagged 32BGRA identical to plain TextureHW.
+    private var toBGRAConverter: PixelBufferConverter?
     /// Published frame counters, so the status can tell "emit never ran" from
     /// "emit ran but nothing was pushed".
     private var emitCount: Int = 0
     private var pushCount: Int = 0
+    /// Split by origin. A bare `emit`/`push` pair cannot distinguish "the
+    /// interpolated frame is produced but rejected" from "the decoded frame is
+    /// rejected twice": both look like a 2:1 ratio.
+    private enum FrameOrigin {
+      case decoded
+      case interpolated
+    }
+    private var emitSrc: Int = 0
+    private var emitInterp: Int = 0
+    private var pushSrc: Int = 0
+    private var pushInterp: Int = 0
+    /// Sampling budget for the blankness probe (see `BlankCheckBudget`).
+    ///
+    /// Guarded by `stateLock` alongside the counters and status fields:
+    /// `publish` runs both on the render worker (decoded frame) and on the
+    /// VideoToolbox completion queue (interpolated frame), while `GetStats`
+    /// reads from the main thread.
+    private var blankBudget = BlankCheckBudget()
+    private let stateLock = NSLock()
 
     init?() {
       guard let processor = MetalFrameProcessor() else {
@@ -212,7 +277,9 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
       let requestedScale = Float(configuration.vtScaleFactor)
       let wantsScaling = requestedScale > 1.0
       guard wantsInterpolation || wantsScaling else {
+        stateLock.lock()
         baseStatus = "nothing requested"
+        stateLock.unlock()
         return false
       }
 
@@ -228,8 +295,11 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
         diagnostics.append("interp[\(probe)]")
         guard VTFrameInterpolator.isSupported(width: width, height: height)
         else {
-          baseStatus = "unsupported interpolation \(width)x\(height) — \(probe)"
-          NSLog("IOS26VideoEnhancer: \(baseStatus)")
+          let message = "unsupported interpolation \(width)x\(height) — \(probe)"
+          stateLock.lock()
+          baseStatus = message
+          stateLock.unlock()
+          NSLog("IOS26VideoEnhancer: \(message)")
           return false
         }
       }
@@ -247,20 +317,24 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
             scaleFactor: requestedScale
           )
         else {
-          baseStatus = "unsupported scaling \(width)x\(height) — \(probe)"
-          NSLog("IOS26VideoEnhancer: \(baseStatus)")
+          let message = "unsupported scaling \(width)x\(height) — \(probe)"
+          stateLock.lock()
+          baseStatus = message
+          stateLock.unlock()
+          NSLog("IOS26VideoEnhancer: \(message)")
           return false
         }
       }
+      NSLog("IOS26VideoEnhancer: probes \(diagnostics.joined(separator: " "))")
 
-      self.width = width
-      self.height = height
-      self.scaleFactor = wantsScaling ? requestedScale : 1.0
+      let sizeChanged = self.width != width || self.height != height
 
       // The Metal processor always runs: it copies the mpv frame into a buffer
       // that survives across frames. Anime4K only when VT is not scaling.
       guard let processor = processor else {
+        stateLock.lock()
         baseStatus = "Metal unavailable"
+        stateLock.unlock()
         return false
       }
       let metalReady = processor.configure(
@@ -270,41 +344,25 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
         height: height
       )
       guard metalReady else {
-        baseStatus = "Metal rejected \(width)x\(height): \(processor.statusDescription)"
-        NSLog("IOS26VideoEnhancer: \(baseStatus)")
+        let message = "Metal rejected \(width)x\(height): \(processor.statusDescription)"
+        stateLock.lock()
+        baseStatus = message
+        stateLock.unlock()
+        NSLog("IOS26VideoEnhancer: \(message)")
         return false
       }
 
-      // Converts the mpv BGRA frame into the format Flutter consumes directly.
-      if toVTConverter == nil {
-        toVTConverter = PixelBufferConverter(
-          width: width,
-          height: height,
-          pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-          providesPool: true
-        )
-      }
-
+      let nextScaler: VTFrameScaler?
+      let nextOutputWidth: Int
+      let nextOutputHeight: Int
       if wantsScaling {
-        let outputSize = VTFrameScaler.outputSize(
+        let scaledSize = VTFrameScaler.outputSize(
           width: width,
           height: height,
           scaleFactor: requestedScale
         )
-        outputWidth = Int(outputSize.width)
-        outputHeight = Int(outputSize.height)
-
-        guard
-          let pool = IOS26VideoEnhancer.makePool(
-            width: outputWidth,
-            height: outputHeight
-          )
-        else {
-          baseStatus = "output pool allocation failed \(outputWidth)x\(outputHeight)"
-          NSLog("IOS26VideoEnhancer: \(baseStatus)")
-          return false
-        }
-        outputPool = pool
+        nextOutputWidth = Int(scaledSize.width)
+        nextOutputHeight = Int(scaledSize.height)
 
         guard
           let scaler = VTFrameScaler(
@@ -313,48 +371,122 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
             scaleFactor: requestedScale
           )
         else {
-          baseStatus = "scaler session failed \(width)x\(height) — \(diagnostics.joined(separator: " "))"
-          NSLog("IOS26VideoEnhancer: \(baseStatus)")
+          let message =
+            "scaler session failed \(width)x\(height) — \(diagnostics.joined(separator: " "))"
+          stateLock.lock()
+          baseStatus = message
+          stateLock.unlock()
+          NSLog("IOS26VideoEnhancer: \(message)")
           return false
         }
-        self.scaler = scaler
         if !scaler.acceptsBGRASource && !scaler.canConvertPixelFormat {
-          baseStatus =
+          let message =
             "scaler needs BGRA conversion but VTPixelTransferSession is "
             + "unavailable \(width)x\(height)"
-          NSLog("IOS26VideoEnhancer: \(baseStatus)")
+          stateLock.lock()
+          baseStatus = message
+          stateLock.unlock()
+          NSLog("IOS26VideoEnhancer: \(message)")
           return false
         }
+        nextScaler = scaler
       } else {
-        outputPool = nil
-        outputWidth = width
-        outputHeight = height
-        scaler?.invalidate()
-        scaler = nil
+        nextOutputWidth = width
+        nextOutputHeight = height
+        nextScaler = nil
       }
 
+      let nextInterpolator: VTFrameInterpolator?
       if wantsInterpolation {
         guard
           let interpolator = VTFrameInterpolator(width: width, height: height)
         else {
-          baseStatus = "interpolation session failed \(width)x\(height) — \(diagnostics.joined(separator: " "))"
-          NSLog("IOS26VideoEnhancer: \(baseStatus)")
+          nextScaler?.invalidate()
+          let message =
+            "interpolation session failed \(width)x\(height) — \(diagnostics.joined(separator: " "))"
+          stateLock.lock()
+          baseStatus = message
+          stateLock.unlock()
+          NSLog("IOS26VideoEnhancer: \(message)")
           return false
         }
-        self.interpolator = interpolator
         if !interpolator.acceptsBGRASource && !interpolator.canConvertPixelFormat
         {
-          baseStatus =
+          nextScaler?.invalidate()
+          interpolator.invalidate()
+          let message =
             "interpolation needs BGRA conversion but VTPixelTransferSession is "
             + "unavailable \(width)x\(height)"
-          NSLog("IOS26VideoEnhancer: \(baseStatus)")
+          stateLock.lock()
+          baseStatus = message
+          stateLock.unlock()
+          NSLog("IOS26VideoEnhancer: \(message)")
           return false
         }
+        nextInterpolator = interpolator
       } else {
-        interpolator?.invalidate()
-        interpolator = nil
+        nextInterpolator = nil
       }
 
+      // Convert interpolated 420v outputs back to untagged 32BGRA via exact
+      // BT.709 Metal math when VT scaling is disabled, so Flutter receives the
+      // same 32BGRA format as plain playback and bypasses Impeller's BT.601 YUV pass.
+      let nextConverter: PixelBufferConverter?
+      if !wantsInterpolation || wantsScaling {
+        nextConverter = nil
+      } else if toBGRAConverter == nil || sizeChanged {
+        guard
+          let created = PixelBufferConverter(
+            width: width,
+            height: height,
+            pixelFormat: kCVPixelFormatType_32BGRA,
+            providesPool: true
+          )
+        else {
+          nextScaler?.invalidate()
+          nextInterpolator?.invalidate()
+          let message = "interpolation BGRA converter unavailable \(width)x\(height)"
+          stateLock.lock()
+          baseStatus = message
+          stateLock.unlock()
+          NSLog("IOS26VideoEnhancer: \(message)")
+          return false
+        }
+        nextConverter = created
+      } else {
+        nextConverter = toBGRAConverter
+      }
+
+      let stages = [
+        wantsInterpolation ? "interp 2x" : nil,
+        wantsScaling ? "scale \(requestedScale)x" : nil,
+      ].compactMap { $0 }.joined(separator: " + ")
+      var convTags: [String] = []
+      if nextInterpolator?.canConvertPixelFormat == true {
+        convTags.append(wantsScaling ? "420v conv" : "BGRA out")
+      }
+      if let nextScaler = nextScaler, nextScaler.canConvertPixelFormat {
+        convTags.append(
+          "scale:\(nextScaler.backendLabel):\(PixelBufferConverter.fourCC(nextScaler.targetPixelFormat))->BGRA"
+        )
+      }
+      let conversion =
+        convTags.isEmpty ? "" : " [\(convTags.joined(separator: ", "))]"
+      let readyStatus =
+        "active: \(stages)\(conversion) \(width)x\(height) → \(nextOutputWidth)x\(nextOutputHeight), "
+        + "anime4k \(wantsScaling ? "off" : configuration.anime4kProfile)"
+
+      stateLock.lock()
+      let oldScaler = self.scaler
+      let oldInterpolator = self.interpolator
+      self.scaler = nextScaler
+      self.interpolator = nextInterpolator
+      self.toBGRAConverter = nextConverter
+      self.width = width
+      self.height = height
+      self.outputWidth = nextOutputWidth
+      self.outputHeight = nextOutputHeight
+      self.scaleFactor = wantsScaling ? requestedScale : 1.0
       frames.clear()
       previousBuffer = nil
       previousTime = .invalid
@@ -363,22 +495,21 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
       lastFailure = ""
       submittedFrames = 0
       interpolateCalls = 0
-      isActive = true
+      emitCount = 0
+      pushCount = 0
+      emitSrc = 0
+      emitInterp = 0
+      pushSrc = 0
+      pushInterp = 0
+      blankBudget.reset()
+      _isActive = true
+      baseStatus = readyStatus
+      stateLock.unlock()
 
-      let stages = [
-        wantsInterpolation ? "interp 2x" : nil,
-        wantsScaling ? "scale \(requestedScale)x" : nil,
-      ].compactMap { $0 }.joined(separator: " + ")
-      // Call out the conversion: VT only accepts 420v on this hardware, so the
-      // frames go through VTPixelTransferSession in both directions.
-      let conversion =
-        (interpolator?.canConvertPixelFormat == true
-          || scaler?.canConvertPixelFormat == true)
-        ? " [420v conv]" : ""
-      baseStatus =
-        "active: \(stages)\(conversion) \(width)x\(height) → \(outputWidth)x\(outputHeight), "
-        + "anime4k \(wantsScaling ? "off" : configuration.anime4kProfile)"
-      NSLog("IOS26VideoEnhancer: \(baseStatus)")
+      oldScaler?.invalidate()
+      oldInterpolator?.invalidate()
+
+      NSLog("IOS26VideoEnhancer: \(readyStatus)")
       return true
     }
 
@@ -390,7 +521,12 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
       guard isActive, let processor = processor else {
         return
       }
+      stateLock.lock()
       submittedFrames += 1
+      let activeInterpolator = interpolator
+      let wantsScaling = scaler != nil
+      let bgraConverter = toBGRAConverter
+      stateLock.unlock()
 
       // 1. Take ownership of the decoded frame. The GL texture buffers are
       //    recycled by TextureHW, so anything kept across frames must be a copy.
@@ -399,8 +535,10 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
         return
       }
 
-      // 2. Emit the original frame.
-      emit(owned, at: presentationTime)
+      // 2. Emit the decoded frame as untagged 32BGRA. When VT scaling runs,
+      //    VTFrameScaler converts tiles to BT.709 420v via Metal and composites
+      //    back to 32BGRA with the exact inverse matrix.
+      emit(owned, at: presentationTime, origin: .decoded)
 
       let previous = previousBuffer
       let previousPTS = previousTime
@@ -409,7 +547,7 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
       submittedCount += 1
 
       // 3. Emit the interpolated frame between the previous and the current one.
-      guard let interpolator = interpolator, let previous = previous,
+      guard let interpolator = activeInterpolator, let previous = previous,
         previousPTS.isValid, presentationTime.isValid
       else {
         return
@@ -427,7 +565,10 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
         )
       )
 
+      stateLock.lock()
       interpolateCalls += 1
+      stateLock.unlock()
+
       interpolator.interpolate(
         previous: previous,
         previousTime: previousPTS,
@@ -435,18 +576,26 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
         sourceTime: presentationTime,
         destination: destination
       ) { [weak self] result in
-        guard let self = self else {
+        guard let self = self, self.isActive else {
           return
         }
         switch result {
         case .failure(let error):
           self.recordFailure("\(error)")
         case .success:
-          if let processor = self.processor, processor.hasAnime4K {
-            let output = processor.process(destination) ?? destination
-            self.emit(output, at: middleTime)
+          if wantsScaling {
+            self.emit(destination, at: middleTime, origin: .interpolated)
           } else {
-            self.emit(destination, at: middleTime)
+            guard let bgra = bgraConverter?.convert(destination) else {
+              self.recordFailure("interpolation BGRA conversion failed")
+              return
+            }
+            if let processor = self.processor, processor.hasAnime4K {
+              let output = processor.process(bgra) ?? bgra
+              self.emit(output, at: middleTime, origin: .interpolated)
+            } else {
+              self.emit(bgra, at: middleTime, origin: .interpolated)
+            }
           }
         }
       }
@@ -456,20 +605,37 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
       return frames.latest()?.pixelBuffer
     }
 
+    func newestFrame() -> CVPixelBuffer? {
+      return frames.newest()?.pixelBuffer
+    }
+
+    func newestEnhanceFrame() -> EnhanceFrame? {
+      return frames.newest()
+    }
+
     func frame(nearestTo time: CMTime) -> CVPixelBuffer? {
       return frames.nearest(to: time)?.pixelBuffer
     }
 
+    func enhanceFrame(nearestTo time: CMTime) -> EnhanceFrame? {
+      return frames.nearest(to: time)
+    }
+
     func invalidate() {
-      isActive = false
+      stateLock.lock()
+      _isActive = false
+      let oldInterpolator = interpolator
+      let oldScaler = scaler
+      interpolator = nil
+      scaler = nil
+      toBGRAConverter = nil
+      stateLock.unlock()
+
       frames.clear()
       previousBuffer = nil
       previousTime = .invalid
-      interpolator?.invalidate()
-      interpolator = nil
-      scaler?.invalidate()
-      scaler = nil
-      outputPool = nil
+      oldInterpolator?.invalidate()
+      oldScaler?.invalidate()
       processor?.invalidate()
     }
 
@@ -479,25 +645,31 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
     ///
     /// The scaler is asynchronous, but submissions are already serialised on
     /// the render worker and the wait is bounded; doing it synchronously keeps
-    /// frame ordering deterministic and stops the output pool from starving.
-    /// Publishes one frame. Scaling runs first when enabled; either way the
-    /// published buffer is 420v, which Flutter's iOS engine consumes directly.
-    ///
-    /// This removes the 420v -> BGRA pass entirely. That pass was where scaling
-    /// went black: CoreImage would report success while writing nothing into a
-    /// 4K BGRA target, and a BGRA-side blank check cannot even tell an unwritten
-    /// buffer apart from content.
-    private func emit(_ buffer: CVPixelBuffer, at time: CMTime) {
+    /// frame ordering deterministic and stops the destination pool from
+    /// starving. Either way the published buffer is consumed directly by
+    /// Flutter's iOS engine — there is no 420v -> BGRA pass.
+    private func emit(
+      _ buffer: CVPixelBuffer,
+      at time: CMTime,
+      origin: FrameOrigin
+    ) {
+      stateLock.lock()
       emitCount += 1
+      switch origin {
+      case .decoded: emitSrc += 1
+      case .interpolated: emitInterp += 1
+      }
+      let activeScaler = scaler
+      stateLock.unlock()
 
-      guard let scaler = scaler else {
-        publish(buffer, at: time)
+      guard let scaler = activeScaler else {
+        publish(buffer, at: time, origin: origin)
         return
       }
 
       guard let destination = scaler.makeDestinationBuffer() else {
         recordFailure("scale destination unavailable")
-        publish(buffer, at: time)
+        publish(buffer, at: time, origin: origin)
         return
       }
 
@@ -517,9 +689,9 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
         semaphore.signal()
       }
 
-      if semaphore.wait(timeout: .now() + 0.3) == .timedOut {
+      if semaphore.wait(timeout: .now() + 0.5) == .timedOut {
         recordFailure("scaler timed out")
-        publish(buffer, at: time)
+        publish(buffer, at: time, origin: origin)
         return
       }
 
@@ -528,103 +700,94 @@ final class MetalOnlyEnhancer: FrameEnhancerProtocol {
       lock.unlock()
       if let recorded = recorded {
         recordFailure("scale: \(recorded)")
-        publish(buffer, at: time)
+        publish(buffer, at: time, origin: origin)
         return
       }
 
-      publish(destination, at: time)
+      publish(destination, at: time, origin: origin)
     }
 
-    /// Publishes a 420v frame. BGRA sources (the mpv frame when scaling and
-    /// interpolation are both off) are converted once; VT output is passed
-    /// through untouched.
-    private func publish(_ buffer: CVPixelBuffer, at time: CMTime) {
-      var output: CVPixelBuffer? = buffer
-      if CVPixelBufferGetPixelFormatType(buffer)
-        != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-      {
-        output = toVTConverter?.convert(buffer)
-      }
-      guard let published = output else {
-        recordFailure("output conversion failed")
+    /// Publishes a frame for presentation.
+    ///
+    /// Every enhanced path publishes untagged `32BGRA` matching plain
+    /// `TextureHW`, so Flutter displays consistent colors without BT.601 shifts.
+    private func publish(
+      _ buffer: CVPixelBuffer,
+      at time: CMTime,
+      origin: FrameOrigin
+    ) {
+      stateLock.lock()
+      let active = _isActive
+      stateLock.unlock()
+
+      guard active else {
         return
       }
-      if PixelBufferConverter.isBlankYUV(published) {
-        recordFailure("published frame is blank")
+
+      // Sampled, not per frame: locking the base address of a GPU written
+      // IOSurface is a synchronisation point, and the VT stages already probe
+      // their own 420v output (see `BlankCheckBudget`).
+      if checkBlankIfNeeded(buffer) {
+        recordFailure(
+          "published frame is blank (\(PixelBufferConverter.sampleCenter(buffer)))"
+        )
         return
       }
-      frames.push(EnhanceFrame(pixelBuffer: published, presentationTime: time))
+
+      stateLock.lock()
+      guard _isActive else {
+        stateLock.unlock()
+        return
+      }
+      frames.push(EnhanceFrame(pixelBuffer: buffer, presentationTime: time))
       pushCount += 1
-      onFrameAvailable?()
+      switch origin {
+      case .decoded: pushSrc += 1
+      case .interpolated: pushInterp += 1
+      }
+      stateLock.unlock()
+    }
+
+    /// Thread safe wrapper around `BlankCheckBudget` that probes without
+    /// holding `stateLock` across CPU pixel-buffer lock/sampling.
+    private func checkBlankIfNeeded(_ buffer: CVPixelBuffer) -> Bool {
+      stateLock.lock()
+      let needs = blankBudget.needsCheck()
+      if !needs {
+        blankBudget.recordSkipped()
+      }
+      stateLock.unlock()
+      guard needs else {
+        return false
+      }
+      let isBlank = PixelBufferConverter.isBlank(buffer)
+      stateLock.lock()
+      blankBudget.recordCheckResult(isBlank: isBlank)
+      stateLock.unlock()
+      return isBlank
     }
 
     /// Keeps the most recent failure in `statusDescription` so the app can show
     /// it instead of "enhancement is on but nothing changed".
     private func recordFailure(_ reason: String) {
+      stateLock.lock()
       failureCount += 1
-      guard reason != lastFailure else {
-        return
+      let count = failureCount
+      let w = width
+      let h = height
+      let changed = reason != lastFailure
+      if changed {
+        lastFailure = reason
+        baseStatus =
+          "active but failing: \(w)x\(h) — \(reason) "
+          + "(\(count) failures)"
       }
-      lastFailure = reason
-      baseStatus =
-        "active but failing: \(width)x\(height) — \(reason) "
-        + "(\(failureCount) failures)"
-      NSLog("IOS26VideoEnhancer: \(baseStatus)")
-    }
+      let message = baseStatus
+      stateLock.unlock()
 
-    /// `true` when the BGRA frame carries no visible content.
-    ///
-    /// Nine samples across the frame: a single non-zero channel means there is
-    /// real picture data. Used to reject frames the conversion pipeline left
-    /// empty even though VideoToolbox reported success.
-    private static func isBlank(_ buffer: CVPixelBuffer) -> Bool {
-      guard
-        CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA,
-        CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess
-      else {
-        return false
+      if changed {
+        NSLog("IOS26VideoEnhancer: \(message)")
       }
-      defer {
-        CVPixelBufferUnlockBaseAddress(buffer, .readOnly)
-      }
-      guard let base = CVPixelBufferGetBaseAddress(buffer) else {
-        return false
-      }
-      let width = CVPixelBufferGetWidth(buffer)
-      let height = CVPixelBufferGetHeight(buffer)
-      let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
-      guard width > 0, height > 0 else {
-        return false
-      }
-      let bytes = base.assumingMemoryBound(to: UInt8.self)
-      for row in 0..<3 {
-        for col in 0..<3 {
-          let x = width * (col * 2 + 1) / 6
-          let y = height * (row * 2 + 1) / 6
-          let offset = y * bytesPerRow + x * 4
-          if bytes[offset] != 0 || bytes[offset + 1] != 0
-            || bytes[offset + 2] != 0
-          {
-            return false
-          }
-        }
-      }
-      return true
-    }
-
-    private static func makePool(
-      width: Int,
-      height: Int
-    ) -> CVPixelBufferPool? {
-      // Route through the shared helper: it puts the minimum buffer count in
-      // the pool attributes (where it belongs) and creates the buffers with
-      // the IOSurface properties CoreImage needs for a 4K render target.
-      return PixelBufferConverter.makeResolvedPool(
-        vtAttributes: nil,
-        width: width,
-        height: height,
-        pixelFormat: kCVPixelFormatType_32BGRA
-      )
     }
   }
 

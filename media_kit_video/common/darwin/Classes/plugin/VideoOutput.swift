@@ -3,6 +3,10 @@ import CoreMedia
 import Foundation
 import QuartzCore
 
+#if canImport(UIKit)
+  import UIKit
+#endif
+
 #if canImport(Flutter)
   import Flutter
 #elseif canImport(FlutterMacOS)
@@ -47,27 +51,37 @@ public class VideoOutput: NSObject {
   private var hardwareTexture: TextureHW?
 
   #if os(iOS)
-    // Drives presentation when an enhancement pipeline is active: the mpv
-    // notify callback alone can not pace interpolated frames.
+    // Drives presentation directly from ProMotion when an interpolated
+    // enhancement pipeline is active.
     private var displayLink: CADisplayLink?
   #endif
-  // Display link ticks are coalesced: at most one pending at a time, otherwise
-  // a slow render worker would queue them without bound.
+  // Guards the diagnostic counters below: they are written from the display
+  // link callback (main thread) and from the render worker.
   private let tickLock = NSLock()
-  private var tickPending: Bool = false
   // Playback clock sampling (see `currentPlaybackClock`).
   private var clockBaseSeconds: Double = 0
   private var clockBaseHostTime: CFTimeInterval = 0
   private var clockSampleHostTime: CFTimeInterval = 0
-  // Per-second rates for diagnostics: display-link ticks, presentation
-  // changes, and how often Flutter actually pulled a texture.
-  private var tickCount: Int = 0
+  // Per-second rates for diagnostics: presentation changes and how often
+  // Flutter actually pulled a texture.
   private var selectCount: Int = 0
-  private var tickRate: Int = 0
   private var selectRate: Int = 0
   private var copyRate: Int64 = 0
   private var copyRateBase: Int64 = 0
   private var lastRateReset: CFTimeInterval = 0
+  // Display link callbacks, counted straight in the callback (no worker hop,
+  // no coalescing), plus the frame interval the system actually granted.
+  // `dl=24@41.67ms` means the system really granted 24 Hz; `dl=120@8.33ms`
+  // with a low `copy` means Flutter is the one dropping the wake up.
+  private var rawTickCount: Int = 0
+  private var displayLinkRate: Int = 0
+  private var displayLinkIntervalMs: Double = 0
+  // Texture notifications actually delivered to Flutter, per second. Compared
+  // against `copyRate` this says whether Flutter dropped the wake up or never
+  // scheduled a frame for it.
+  private var notifyCount: Int = 0
+  private var notifyBase: Int = 0
+  private var notifyRate: Int = 0
 
   init(
     handle: Int64,
@@ -108,9 +122,9 @@ public class VideoOutput: NSObject {
     }
   }
 
-  /// Hot-swaps the enhancement pipeline. \`nil\` disables it.
+  /// Hot-swaps the enhancement pipeline. `nil` disables it.
   ///
-  /// Runs on the render worker so that it is ordered against \`render\` calls.
+  /// Runs on the render worker so that it is ordered against `render` calls.
   public func setEnhancePipeline(_ configuration: VideoEnhanceConfiguration?) {
     enhanceConfiguration = configuration
     worker.enqueue {
@@ -137,30 +151,61 @@ public class VideoOutput: NSObject {
 
   private func updateRatesIfNeeded() {
     let now = CACurrentMediaTime()
+    tickLock.lock()
     if lastRateReset == 0 {
       lastRateReset = now
+      tickLock.unlock()
       return
     }
     guard now - lastRateReset >= 1.0 else {
+      tickLock.unlock()
       return
     }
-    tickRate = tickCount
-    selectRate = selectCount
-    let total = hardwareTexture?.copyCounter() ?? 0
-    copyRate = total - copyRateBase
-    copyRateBase = total
-    tickCount = 0
-    selectCount = 0
     lastRateReset = now
+    let currentSelect = selectCount
+    selectCount = 0
+    let currentTicks = rawTickCount
+    rawTickCount = 0
+    let currentNotify = notifyCount
+    tickLock.unlock()
+
+    #if os(iOS)
+      let totalCopies = hardwareTexture?.copyCounter() ?? 0
+    #endif
+
+    tickLock.lock()
+    selectRate = currentSelect
+    displayLinkRate = currentTicks
+    notifyRate = max(0, currentNotify - notifyBase)
+    notifyBase = currentNotify
+    #if os(iOS)
+      copyRate = max(0, totalCopies - copyRateBase)
+      copyRateBase = totalCopies
+    #endif
+    tickLock.unlock()
   }
 
   /// Human readable enhancement state, surfaced to Dart for diagnostics.
+  ///
+  /// `dl` / `dlMs` come from the display link's own `targetTimestamp`, counted
+  /// before any coalescing, so they cannot be polluted by a slow worker:
+  /// `dl=24@41.67ms` means the system really granted 24 Hz, while
+  /// `dl=120@8.33ms` with a low `copy` means Flutter is dropping the wake up.
   public func enhanceStatus() -> String {
     #if os(iOS)
       var text =
         hardwareTexture?.enhanceStatusDescription()
         ?? "unavailable (software rendering)"
-      text += " | hz tick=\(tickRate) sel=\(selectRate) copy=\(copyRate)"
+      tickLock.lock()
+      let sel = selectRate
+      let copy = copyRate
+      let notify = notifyRate
+      let dl = displayLinkRate
+      let interval = String(format: "%.2f", displayLinkIntervalMs)
+      tickLock.unlock()
+      text +=
+        " | hz sel=\(sel) copy=\(copy)"
+        + " notify=\(notify) dl=\(dl)@\(interval)ms"
       return text
     #else
       return "unavailable (not iOS)"
@@ -193,20 +238,15 @@ public class VideoOutput: NSObject {
     let update: () -> Void = { [weak self] in
       self?.updateCallback()
     }
-    // Invoked by the enhancement pipeline when it produced a frame without mpv
-    // being involved (e.g. an interpolated frame). It must not trigger another
-    // mpv render.
-    let notify: () -> Void = { [weak self] in
-      self?.notifyFrameAvailable()
-    }
     var hardwareTexture: ResizableTextureProtocol?
     if enableHardwareAcceleration {
       #if os(iOS)
+        // Presentation is driven from `_updateCallback` and the half frame
+        // timer only; the texture does not wake Flutter on its own.
         let texture = TextureHW(
           handle: handle,
           configuration: enhanceConfiguration,
-          updateCallback: update,
-          notifyCallback: notify
+          updateCallback: update
         )
         self.hardwareTexture = texture
         hardwareTexture = texture
@@ -267,6 +307,15 @@ public class VideoOutput: NSObject {
         }
         link.add(to: .main, forMode: .common)
         self.displayLink = link
+        #if canImport(UIKit)
+          // Logged once: if `maximumFramesPerSecond` is 120 while `dl` in the
+          // status line stays at 24, the ceiling is the granted range or the
+          // system's adaptive sync, not the panel.
+          NSLog(
+            "VideoOutput: display link started, screen max "
+              + "\(UIScreen.main.maximumFramesPerSecond) Hz, requested 48~120 Hz"
+          )
+        #endif
       }
     #endif
   }
@@ -282,34 +331,39 @@ public class VideoOutput: NSObject {
 
   #if os(iOS)
     @objc private func handleDisplayTick(_ link: CADisplayLink) {
+      // Count every callback and the granted interval *before* selecting so
+      // ProMotion headroom stays visible even when a frame is unchanged.
       tickLock.lock()
-      if tickPending {
-        tickLock.unlock()
-        return
+      rawTickCount += 1
+      let granted = link.targetTimestamp - link.timestamp
+      if granted > 0 {
+        displayLinkIntervalMs = granted * 1000
       }
-      tickPending = true
       tickLock.unlock()
 
-      worker.enqueue {
-        self.tickLock.lock()
-        self.tickPending = false
-        self.tickLock.unlock()
-        self._displayTick()
+      guard !disposed else { return }
+      updateRatesIfNeeded()
+
+      let tid = textureId
+      guard tid >= 0,
+        let hardwareTexture = hardwareTexture,
+        hardwareTexture.needsHalfFrameTick
+      else {
+        return
+      }
+
+      // Direct presentation from the main-thread display link avoids hopping
+      // onto `worker`, which previously dropped half-frame ticks behind
+      // synchronous GL + CoreImage + VT work for the next decoded frame.
+      if hardwareTexture.selectFrame(at: hardwareTexture.playbackClock()) {
+        tickLock.lock()
+        selectCount += 1
+        notifyCount += 1
+        tickLock.unlock()
+        registry.textureFrameAvailable(tid)
       }
     }
   #endif
-
-  /// Picks the enhanced frame that belongs to the current playback clock and
-  /// wakes Flutter when it changed. Runs on the render worker.
-  ///
-  /// Kept for compatibility: presentation is now driven from `_updateCallback`
-  /// plus the half-frame timer, so this only maintains the tick counter that
-  /// the status line reports.
-  private func _displayTick() {
-    guard !disposed else { return }
-    tickCount += 1
-    updateRatesIfNeeded()
-  }
 
   /// Audio clock of the playing stream, extrapolated between samples.
   ///
@@ -384,8 +438,15 @@ public class VideoOutput: NSObject {
   /// Must run on the render worker.
   private func notifyOnMain() {
     guard !disposed else { return }
-    DispatchQueue.main.sync { [weak self] in
-      guard let that = self else { return }
+    tickLock.lock()
+    notifyCount += 1
+    tickLock.unlock()
+    // `async`, never `sync`: this runs on the render worker, and a synchronous
+    // hop lets the main thread — Flutter's platform thread, busy with danmaku
+    // layout and gestures — stall the whole pipeline. It is also a deadlock
+    // waiting to happen when the player is torn down mid-frame.
+    DispatchQueue.main.async { [weak self] in
+      guard let that = self, !that.disposed else { return }
       // Textures must be marked as available from the main thread
       that.registry.textureFrameAvailable(that.textureId)
     }
@@ -397,6 +458,10 @@ public class VideoOutput: NSObject {
 
   private func _updateCallback() {
     guard !disposed else { return }
+    // Refresh the per-second rates from the render callback: the display link
+    // no longer hops onto the worker, so it cannot drive this any more.
+    updateRatesIfNeeded()
+
     let size = videoSize
 
     if size.width == 0 || size.height == 0 {
@@ -424,39 +489,24 @@ public class VideoOutput: NSObject {
       if let hardwareTexture = hardwareTexture,
         hardwareTexture.hasActiveEnhancer
       {
-        // Present the delayed frame immediately, then the interpolated frame
-        // half a frame later. Driving this from the mpv frame callback (rather
-        // than polling a display link) means the pacing follows the decoder
-        // exactly, and a missing interpolated frame is simply skipped.
-        if hardwareTexture.selectFrame(at: hardwareTexture.playbackClock()) {
-          selectCount += 1
-          notifyOnMain()
+        // When interpolation is active, presentation is driven directly from
+        // `handleDisplayTick` on the main-thread CADisplayLink so intermediate
+        // frames are never starved behind queued worker renders. For non-
+        // interpolated modes (e.g. scaling or Anime4K only), present immediately.
+        if !hardwareTexture.needsHalfFrameTick {
+          if hardwareTexture.selectFrame(at: .invalid) {
+            tickLock.lock()
+            selectCount += 1
+            tickLock.unlock()
+            notifyOnMain()
+          }
         }
-        scheduleHalfFrameTick(hardwareTexture)
         return
       }
     #endif
 
     _notifyTexture()
   }
-
-  #if os(iOS)
-    /// Schedules a single presentation attempt half a frame after the current
-    /// one, where the interpolated frame belongs.
-    private func scheduleHalfFrameTick(_ texture: TextureHW) {
-      let delay = texture.halfFrameInterval()
-      DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-        guard let self = self, !self.disposed else { return }
-        self.worker.enqueue {
-          guard !self.disposed else { return }
-          if texture.selectFrame(at: texture.playbackClock()) {
-            self.selectCount += 1
-            self.notifyOnMain()
-          }
-        }
-      }
-    }
-  #endif
 
     private var videoSize: CGSize {
         // fixed size

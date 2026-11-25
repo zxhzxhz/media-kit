@@ -12,7 +12,6 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
 
   private let handle: OpaquePointer
   private let updateCallback: UpdateCallback
-  private let notifyCallback: UpdateCallback
   private let context: EAGLContext
   private let textureCache: CVOpenGLESTextureCache
   private var renderContext: OpaquePointer?
@@ -38,6 +37,8 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
   /// \`presentationLock\` because the render worker writes it while the Flutter
   /// raster thread reads it from \`copyPixelBuffer\`.
   private var selectedBuffer: CVPixelBuffer?
+  /// PTS of `selectedBuffer`, used to keep clock-based selection monotonic.
+  private var lastSelectedPTS: CMTime = .invalid
   private let presentationLock = NSLock()
   /// Last buffer handed to Flutter, used to count *distinct* presented frames.
   private var lastPresentedBuffer: CVPixelBuffer?
@@ -72,19 +73,19 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
   /// Monotonic timestamp handed to the enhancer with each frame.
   private var syntheticPTS: Double = 0
   private var lastRenderHostTime: CFTimeInterval = 0
+  /// Last output size and pixel format selected for presentation, for diagnostics.
+  private var lastOutputFormat: String = ""
   /// Human readable state of the enhancement pipeline.
   private var enhanceStatus: String = "disabled"
 
   init(
     handle: OpaquePointer,
     configuration: VideoEnhanceConfiguration?,
-    updateCallback: @escaping UpdateCallback,
-    notifyCallback: @escaping UpdateCallback
+    updateCallback: @escaping UpdateCallback
   ) {
     self.handle = handle
     self.enhanceConfiguration = configuration
     self.updateCallback = updateCallback
-    self.notifyCallback = notifyCallback
     self.context = OpenGLESHelpers.createContext()
     self.textureCache = OpenGLESHelpers.createTextureCache(context)
 
@@ -151,13 +152,28 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     return copyCount
   }
 
-  /// \`true\` once an enhancement pipeline is configured and running.
+  /// `true` once an enhancement pipeline is configured and running.
   public var hasActiveEnhancer: Bool {
-    return enhancer?.isActive ?? false
+    presentationLock.lock()
+    let active = enhancer?.isActive ?? false
+    presentationLock.unlock()
+    return active
   }
 
-  /// \`true\` once the display link has taken over presentation. From that moment
-  /// \`VideoOutput\` must not notify Flutter on every mpv frame, otherwise the
+  /// `true` when the active enhancer produces intermediate frames and needs a
+  /// mid-frame presentation tick.
+  public var needsHalfFrameTick: Bool {
+    presentationLock.lock()
+    let current = enhancer
+    presentationLock.unlock()
+    guard let enhancer = current, enhancer.isActive else {
+      return false
+    }
+    return enhancer.producesInterpolatedFrames
+  }
+
+  /// `true` once the display link has taken over presentation. From that moment
+  /// `VideoOutput` must not notify Flutter on every mpv frame, otherwise the
   /// pacing decided here is overwritten.
   public var isDrivingPresentation: Bool {
     presentationLock.lock()
@@ -167,16 +183,28 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     return selectedBuffer != nil
   }
 
-  /// Picks the enhanced frame that belongs to \`clock\`.
+  /// Presentation policy.
   ///
-  /// Returns \`true\` when the frame to present changed, so the caller knows it
+  /// Clock based selection (`frame(nearestTo:)`) is what makes an interpolated
+  /// frame visible: the queue is sorted by PTS, the clock lags two frames, and
+  /// the half frame timer asks for the frame that belongs at the midpoint.
+  ///
+  /// `false` would publish the highest PTS instead, i.e. always the decoded
+  /// frame — stable, but interpolation would never be visible. Kept as a flag
+  /// so a regression can be bisected without touching the pacing code.
+  private static let selectsByPlaybackClock = true
+
+  /// Picks the enhanced frame that belongs to `clock`.
+  ///
+  /// Returns `true` when the frame to present changed, so the caller knows it
   /// has to wake Flutter. Runs on the render worker.
   public func selectFrame(at clock: CMTime) -> Bool {
     presentationLock.lock()
     selectAttempts += 1
+    let currentEnhancer = enhancer
     presentationLock.unlock()
 
-    guard let enhancer = enhancer else {
+    guard let enhancer = currentEnhancer else {
       recordSelectMiss("no enhancer")
       return false
     }
@@ -184,25 +212,52 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
       recordSelectMiss("inactive")
       return false
     }
-    // Publish the newest frame instead of resolving against the clock.
-    //
-    // Clock based selection needs the presentation clock to be frame accurate,
-    // and it is not: ProMotion throttles the whole app to the video's 24 Hz, so
-    // the half-frame tick fires before VT has produced the interpolated frame
-    // and the clock has already moved past it by the time it arrives. Taking
-    // whatever is newest means an interpolated frame is shown as soon as it
-    // exists, which is the only way it can ever be visible under a coarse
-    // refresh clock.
-    guard let next = enhancer.latestFrame() else {
+
+    let useClock =
+      enhancer.producesInterpolatedFrames
+      && TextureHW.selectsByPlaybackClock
+      && clock.isValid
+    let candidate: EnhanceFrame?
+    if useClock {
+      candidate = enhancer.enhanceFrame(nearestTo: clock)
+    } else {
+      // Without interpolation (scaling-only or Anime4K-only), frames are pushed
+      // synchronously in `submit()`, so always present the highest PTS with
+      // zero lag; also used as fallback before the clock anchor is valid.
+      candidate = enhancer.newestEnhanceFrame()
+    }
+    guard let chosen = candidate else {
       recordSelectMiss("empty queue")
       return false
     }
+    let next = chosen.pixelBuffer
+    let nextPTS = chosen.presentationTime
+
+    let fmt: String
+    if #available(iOS 16.0, *) {
+      fmt = PixelBufferConverter.fourCC(CVPixelBufferGetPixelFormatType(next))
+    } else {
+      fmt = "\(CVPixelBufferGetPixelFormatType(next))"
+    }
+    let outDesc =
+      "\(CVPixelBufferGetWidth(next))x\(CVPixelBufferGetHeight(next)):\(fmt)"
 
     presentationLock.lock()
+    if useClock,
+      lastSelectedPTS.isValid,
+      nextPTS.isValid,
+      CMTimeCompare(nextPTS, lastSelectedPTS) < 0
+    {
+      presentationLock.unlock()
+      recordSelectMiss("older pts")
+      return false
+    }
     let changed = selectedBuffer !== next
     selectedBuffer = next
     if changed {
+      lastSelectedPTS = nextPTS
       selectChanged += 1
+      lastOutputFormat = outDesc
     }
     presentationLock.unlock()
 
@@ -229,8 +284,11 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     let hostTime = clockAnchorHostTime
     presentationLock.unlock()
 
-    guard anchor.isValid, hostTime > 0 else {
+    guard anchor.isValid else {
       return .invalid
+    }
+    guard hostTime > 0 else {
+      return anchor
     }
     let elapsed = min(max(CACurrentMediaTime() - hostTime, 0), 0.12)
     return CMTimeAdd(
@@ -239,7 +297,7 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     )
   }
 
-  /// Human readable enhancement state (see \`FrameEnhancerProtocol.statusDescription\`).
+  /// Human readable enhancement state (see `FrameEnhancerProtocol.statusDescription`).
   public func enhanceStatusDescription() -> String {
     // Read live instead of returning the string captured in
     // `configureEnhancer`: a cached snapshot made every counter look frozen at
@@ -251,14 +309,18 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     let attempts = selectAttempts
     let changed = selectChanged
     let miss = lastSelectMiss
+    let outFmt = lastOutputFormat
+    let currentEnhancer = enhancer
+    let status = enhanceStatus
     presentationLock.unlock()
 
-    var text = enhanceStatus
-    if let enhancer = enhancer, enhancer.isActive {
+    var text = status
+    if let enhancer = currentEnhancer, enhancer.isActive {
       text = enhancer.statusDescription
     }
+    let outSegment = outFmt.isEmpty ? "" : " | out=\(outFmt)"
     return
-      "\(text) | renders=\(renders) submits=\(submits) select=\(changed)/\(attempts) miss=\(miss)"
+      "\(text)\(outSegment) | renders=\(renders) submits=\(submits) select=\(changed)/\(attempts) miss=\(miss)"
   }
 
   /// Number of distinct frames handed to Flutter since playback started.
@@ -274,21 +336,25 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
   private func resetPresentation() {
     presentationLock.lock()
     selectedBuffer = nil
+    lastSelectedPTS = .invalid
     lastPresentedBuffer = nil
+    lastOutputFormat = ""
     clockAnchorPTS = .invalid
     clockAnchorHostTime = 0
     lastSubmittedPTS = .invalid
     previousSubmittedPTS = .invalid
     frameIntervalSeconds = 1.0 / 24.0
-    copyCount = 0
     syntheticPTS = 0
     lastRenderHostTime = 0
     presentationLock.unlock()
   }
 
   public func dispose() {
-    enhancer?.invalidate()
+    presentationLock.lock()
+    let currentEnhancer = enhancer
     enhancer = nil
+    presentationLock.unlock()
+    currentEnhancer?.invalidate()
     resetPresentation()
     disposeMPV()
   }
@@ -296,10 +362,18 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
   /// Hot-swaps the enhancement pipeline. Must be called on the render worker.
   public func setEnhancePipeline(_ configuration: VideoEnhanceConfiguration?) {
     enhanceConfiguration = configuration
-    // The frame the display link picked belongs to the old pipeline: drop it so
-    // the next tick starts from a clean state.
+    // Detach and tear down any existing enhancer first so the 120 Hz display
+    // link cannot pick stale timestamps into `lastSelectedPTS` while the new
+    // pipeline is configuring.
+    presentationLock.lock()
+    let old = enhancer
+    enhancer = nil
+    presentationLock.unlock()
+    old?.invalidate()
+
     resetPresentation()
     configureEnhancer(currentSize)
+    resetPresentation()
   }
 
   private func initMPV() {
@@ -369,10 +443,17 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     }
 
     NSLog("TextureGL: resize: \(size.width)x\(size.height)")
+    presentationLock.lock()
+    let old = enhancer
+    enhancer = nil
+    presentationLock.unlock()
+    old?.invalidate()
+
     createPixelBuffer(size)
     currentSize = size
     resetPresentation()
     configureEnhancer(size)
+    resetPresentation()
   }
 
   private func createPixelBuffer(_ size: CGSize) {
@@ -415,36 +496,48 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
       return
     }
 
+    presentationLock.lock()
+    var currentEnhancer = enhancer
+    presentationLock.unlock()
+
     guard let configuration = enhanceConfiguration else {
-      enhancer?.invalidate()
+      presentationLock.lock()
+      let old = enhancer
       enhancer = nil
       enhanceStatus = "disabled"
+      presentationLock.unlock()
+      old?.invalidate()
       return
     }
 
-    if enhancer == nil {
+    if currentEnhancer == nil {
       var reason = ""
-      enhancer = VideoEnhancerFactory.make(
+      let created = VideoEnhancerFactory.make(
         configuration: configuration,
         reason: &reason
       )
-      enhancer?.onFrameAvailable = { [weak self] in
-        guard let self = self else { return }
-        // An enhanced frame (usually the interpolated one) is ready: publish it
-        // immediately. Waiting for the next mpv frame lets it be overwritten by
-        // the next source frame before it is ever shown.
-        _ = self.selectFrame(at: .invalid)
-        self.notifyCallback()
-      }
-      if enhancer == nil {
+      // The pipeline is a pure producer: it enqueues frames and never wakes
+      // Flutter. Presentation is driven exclusively from `VideoOutput`
+      // (mpv frame callback + one half frame timer), which is what keeps the
+      // notify interval a steady 20.83 ms instead of following the jittery
+      // VideoToolbox completion time.
+      guard let created = created else {
+        presentationLock.lock()
         enhanceStatus = "unavailable: \(reason)"
+        presentationLock.unlock()
         NSLog("TextureHW: no enhancement pipeline available — \(reason)")
         return
       }
+      currentEnhancer = created
+      presentationLock.lock()
+      enhancer = created
+      presentationLock.unlock()
     }
 
-    guard let enhancer = enhancer else {
+    guard let enhancer = currentEnhancer else {
+      presentationLock.lock()
       enhanceStatus = "unavailable"
+      presentationLock.unlock()
       return
     }
 
@@ -459,17 +552,23 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     )
 
     if !ready {
-      enhanceStatus = "rejected: \(enhancer.statusDescription)"
-      NSLog("TextureHW: \(enhanceStatus); using plain rendering")
-      enhancer.invalidate()
+      let failedStatus = "rejected: \(enhancer.statusDescription)"
+      presentationLock.lock()
+      enhanceStatus = failedStatus
       self.enhancer = nil
+      presentationLock.unlock()
+      NSLog("TextureHW: \(failedStatus); using plain rendering")
+      enhancer.invalidate()
     } else {
-      enhanceStatus = enhancer.statusDescription
-      NSLog("TextureHW: enhancement ready — \(enhanceStatus)")
+      let readyStatus = enhancer.statusDescription
+      presentationLock.lock()
+      enhanceStatus = readyStatus
+      presentationLock.unlock()
+      NSLog("TextureHW: enhancement ready — \(readyStatus)")
     }
   }
 
-  private func currentPresentationTime() -> CMTime {
+  private func currentPresentationTime() -> (pts: CMTime, hostTime: CFTimeInterval) {
     // `time-pos` is quantised by mpv's property update rate and can return the
     // *same* value for two consecutive frames. Identical timestamps make an
     // interpolated frame indistinguishable from its source, so the display
@@ -488,7 +587,7 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
       }
     }
     lastRenderHostTime = now
-    return CMTime(seconds: syntheticPTS, preferredTimescale: 1000)
+    return (CMTime(seconds: syntheticPTS, preferredTimescale: 1000), now)
   }
 
   public func render(_ size: CGSize) {
@@ -531,19 +630,25 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
 
     textureContexts.pushAsReady(textureContext!)
 
+    presentationLock.lock()
+    let currentEnhancer = enhancer
+    presentationLock.unlock()
+
     // Hand the freshly rendered buffer to the enhancement pipeline. \`submit\` is
     // documented to copy whatever it needs, so the GL buffer can be recycled.
-    if let enhancer = enhancer, enhancer.isActive {
+    if let enhancer = currentEnhancer, enhancer.isActive {
       frameIndex += 1
-      let presentationTime = currentPresentationTime()
-      // Present two frames behind the newest decoded frame.
-      //
-      // The interpolated frame sits between the previous and the current frame.
-      // With a one-frame lag the clock reaches the midpoint only 31.25 ms into
-      // a 41.67 ms interval, so a VT pipeline that takes 32~40 ms produces the
-      // frame *after* the selection window has passed: it arrives already
-      // expired, is never selected, and nothing reports a failure. Two frames
-      // of lag give the asynchronous pipeline a full interval.
+      let (presentationTime, renderHostTime) = currentPresentationTime()
+      enhancer.submit(
+        textureContext!.pixelBuffer,
+        presentationTime: presentationTime,
+        frameIndex: frameIndex
+      )
+      let postSubmitTime = CACurrentMediaTime()
+      let submitDuration = postSubmitTime - renderHostTime
+      // Update the clock anchor atomically *after* `submit` completes so the
+      // display link never observes a torn (new PTS, old hostTime) pair and
+      // slow 4K synchronous work does not skip the interpolated midpoint frame.
       presentationLock.lock()
       if lastSubmittedPTS.isValid {
         let delta = CMTimeGetSeconds(
@@ -554,21 +659,20 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
         }
       }
       if previousSubmittedPTS.isValid {
+        let effectiveHostTime =
+          submitDuration > frameIntervalSeconds * 0.4
+          ? postSubmitTime
+          : renderHostTime
         clockAnchorPTS = previousSubmittedPTS
-      } else if lastSubmittedPTS.isValid {
-        clockAnchorPTS = lastSubmittedPTS
+        clockAnchorHostTime = effectiveHostTime
       } else {
-        clockAnchorPTS = presentationTime
+        clockAnchorPTS =
+          lastSubmittedPTS.isValid ? lastSubmittedPTS : presentationTime
+        clockAnchorHostTime = 0
       }
-      clockAnchorHostTime = CACurrentMediaTime()
       previousSubmittedPTS = lastSubmittedPTS
       lastSubmittedPTS = presentationTime
       presentationLock.unlock()
-      enhancer.submit(
-        textureContext!.pixelBuffer,
-        presentationTime: presentationTime,
-        frameIndex: frameIndex
-      )
     }
   }
 

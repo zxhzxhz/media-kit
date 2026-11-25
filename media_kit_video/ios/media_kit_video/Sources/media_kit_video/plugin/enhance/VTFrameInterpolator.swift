@@ -35,7 +35,7 @@ enum VTFrameInterpolatorError: Error {
   /// BGRA <-> the VideoToolbox format conversion failed.
   case formatConversionFailed
   /// VT reported success but the destination planes are empty.
-  case blankOutput
+  case blankOutput(String)
 }
 
 /// Availability probe that is callable from iOS 13 deployment targets.
@@ -174,6 +174,8 @@ final class VTFrameInterpolator {
   /// is converted once instead of twice.
   private var previousVTFrame: CVPixelBuffer?
   private var previousVTFrameTime: CMTime = .invalid
+  /// Sampling budget for the blankness probe (see `BlankCheckBudget`).
+  private var blankBudget = BlankCheckBudget()
 
   private var submitted: Int = 0
   private var succeeded: Int = 0
@@ -186,10 +188,17 @@ final class VTFrameInterpolator {
 
   /// Compact counters, surfaced through the enhancer status string.
   var statsDescription: String {
+    lock.lock()
+    let s = submitted
+    let ok = succeeded
+    let f = failed
+    let to = timedOut
+    let err = lastError
+    lock.unlock()
     var text =
-      "interp submit=\(submitted) ok=\(succeeded) fail=\(failed) to=\(timedOut)"
-    if !lastError.isEmpty {
-      text += " last=\(lastError)"
+      "interp submit=\(s) ok=\(ok) fail=\(f) to=\(to)"
+    if !err.isEmpty {
+      text += " last=\(err)"
     }
     return text
   }
@@ -214,22 +223,29 @@ final class VTFrameInterpolator {
       self.acceptsBGRASource = formats.contains(kCVPixelFormatType_32BGRA)
     }
 
-    if !self.acceptsBGRASource {
-      // The destination pool is required regardless of whether VT accepts
-      // BGRA: the caller allocates from it (see makeDestinationBuffer).
-      let target: OSType = formats.first ?? kCVPixelFormatType_32BGRA
-      guard
-        let inputDestination = PixelBufferConverter(
-          width: width, height: height,
-          pixelFormat: target, providesPool: true,
-          vtAttributes: configuration.destinationPixelBufferAttributes
-        )
-      else {
-        NSLog("VTFrameInterpolator: cannot create the destination pool")
-        return nil
-      }
-      self.vtDestinationConverter = inputDestination
+    // The destination pool is required no matter which formats VT advertises:
+    // the caller allocates the output from it (`makeDestinationBuffer`).
+    // Creating it only inside the conversion branch was the same bug
+    // `VTFrameScaler` had — if VT advertises BGRA, or the format list is empty
+    // so `acceptsBGRASource` keeps its `true` default, the pool stayed nil and
+    // every frame failed with "interpolation destination unavailable".
+    let target: OSType =
+      formats.contains(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+      ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+      : (formats.first ?? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+    guard
+      let destination = PixelBufferConverter(
+        width: width, height: height,
+        pixelFormat: target, providesPool: true,
+        vtAttributes: configuration.destinationPixelBufferAttributes
+      )
+    else {
+      NSLog("VTFrameInterpolator: cannot create the destination pool")
+      return nil
+    }
+    self.vtDestinationConverter = destination
 
+    if !self.acceptsBGRASource {
       guard
         let input = PixelBufferConverter(
           width: width, height: height,
@@ -392,7 +408,9 @@ final class VTFrameInterpolator {
       // serialises the *calls*, not the completions. Wait here so the next
       // submission cannot overlap this one; a timeout means the processor is
       // stuck, in which case the frame is dropped instead of blocking forever.
+      self.lock.lock()
       self.submitted += 1
+      self.lock.unlock()
       let semaphore = DispatchSemaphore(value: 0)
       let errorLock = NSLock()
       var processError: Error?
@@ -406,7 +424,9 @@ final class VTFrameInterpolator {
       if semaphore.wait(timeout: .now() + VTFrameInterpolator.processTimeout)
         == .timedOut
       {
+        self.lock.lock()
         self.timedOut += 1
+        self.lock.unlock()
         self.finish(completion, .failure(VTFrameInterpolatorError.timedOut))
         return
       }
@@ -423,16 +443,23 @@ final class VTFrameInterpolator {
         return
       }
 
-      // Same reasoning as VTFrameScaler: check the 420v output directly.
-      if PixelBufferConverter.isBlankYUV(vtDestination) {
+      PixelBufferConverter.applyColorAttachments(to: vtDestination)
+
+      // Same reasoning as VTFrameScaler: check the 420v output directly, but
+      // sampled rather than every frame — locking a buffer the ANE just wrote
+      // is a synchronisation point (see `BlankCheckBudget`).
+      if self.blankBudget.checkIfBlank(vtDestination) {
+        let sample = PixelBufferConverter.sampleCenter(vtDestination)
         self.finish(
           completion,
-          .failure(VTFrameInterpolatorError.blankOutput)
+          .failure(VTFrameInterpolatorError.blankOutput(sample))
         )
         return
       }
 
+      self.lock.lock()
       self.succeeded += 1
+      self.lock.unlock()
       self.finish(completion, .success(()))
     }
   }
@@ -463,8 +490,10 @@ final class VTFrameInterpolator {
   private func finish(_ completion: @escaping (Result<Void, Error>) -> Void,
                       _ result: Result<Void, Error>) {
     if case .failure(let error) = result {
+      lock.lock()
       failed += 1
       lastError = "\(error)"
+      lock.unlock()
     }
     queue.async { completion(result) }
   }
